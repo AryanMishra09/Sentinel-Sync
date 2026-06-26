@@ -1,0 +1,39 @@
+# Phase 2 — three independent replicas.
+#
+# Each container runs the same image with different env vars. Docker's network
+# makes replica-a/b/c resolvable as hostnames between containers. PEERS tells
+# each replica the in-network address of the other two — but in Phase 2 nobody
+# dials anyone; the addresses are recorded for /status and used starting Phase 4.
+#
+# Host port mapping (left) lets you curl each replica directly; inside the
+# network every replica listens on :8080.
+services:
+  replica-a:
+    build: .
+    container_name: replica-a
+    ports:
+      - "8080:8080"
+    environment:
+      REPLICA_ID: replica-a
+      REST_ADDR: ":8080"
+      PEERS: "replica-b=http://replica-b:8080,replica-c=http://replica-c:8080"
+
+  replica-b:
+    build: .
+    container_name: replica-b
+    ports:
+      - "8081:8080"
+    environment:
+      REPLICA_ID: replica-b
+      REST_ADDR: ":8080"
+      PEERS: "replica-a=http://replica-a:8080,replica-c=http://replica-c:8080"
+
+  replica-c:
+    build: .
+    container_name: replica-c
+    ports:
+      - "8082:8080"
+    environment:
+      REPLICA_ID: replica-c
+      REST_ADDR: ":8080"
+      PEERS: "replica-a=http://replica-a:8080,replica-b=http://replica-b:8080"

@@ -1,4 +1,4 @@
-.PHONY: build run test tidy clean
+.PHONY: build run test tidy clean docker-up docker-down docker-logs
 
 # Compile the replica binary to bin/replica.
 build:
@@ -15,6 +15,18 @@ test:
 # Sync dependencies.
 tidy:
 	go mod tidy
+
+# Build images and start the 3-replica cluster (replica-a/b/c).
+docker-up:
+	docker compose up --build -d
+
+# Stop and remove the cluster.
+docker-down:
+	docker compose down
+
+# Tail logs from all replicas.
+docker-logs:
+	docker compose logs -f
 
 # Remove build artifacts.
 clean:

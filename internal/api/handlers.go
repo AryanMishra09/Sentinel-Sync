@@ -11,18 +11,19 @@ import (
 	"net/http"
 
 	"github.com/aryan-mishra/sentinel-sync/internal/graph"
+	"github.com/aryan-mishra/sentinel-sync/internal/replica"
 	"github.com/gin-gonic/gin"
 )
 
-// Handler wires HTTP requests to the graph engine.
+// Handler wires HTTP requests to one replica.
 type Handler struct {
-	replicaID string
-	graph     *graph.Graph
+	replica *replica.Replica
+	graph   *graph.Graph
 }
 
-// NewHandler builds a handler bound to one replica's graph.
-func NewHandler(replicaID string, g *graph.Graph) *Handler {
-	return &Handler{replicaID: replicaID, graph: g}
+// NewHandler builds a handler bound to a replica (and its graph).
+func NewHandler(r *replica.Replica) *Handler {
+	return &Handler{replica: r, graph: r.Graph}
 }
 
 // --- request bodies --------------------------------------------------------
@@ -130,9 +131,12 @@ func (h *Handler) handleGetGraph(c *gin.Context) {
 func (h *Handler) handleStatus(c *gin.Context) {
 	nodes, edges := h.graph.Counts()
 	c.JSON(http.StatusOK, gin.H{
-		"replicaId": h.replicaID,
-		"nodes":     nodes,
-		"edges":     edges,
+		"replicaId":   h.replica.ID,
+		"peers":       h.replica.Peers,
+		"nodes":       nodes,
+		"edges":       edges,
+		"vectorClock": h.replica.Clock(),
+		"opLogLen":    h.replica.OpLogLen(),
 	})
 }
 

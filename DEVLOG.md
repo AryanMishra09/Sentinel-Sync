@@ -26,6 +26,15 @@ asked *"how does a cluster stay available when nodes die?"*, SentinelSync asks
 13. [Phase 1 — Demo Output](#13-phase-1--demo-output)
 14. [Known Limitations & What Phase 2 Adds](#14-known-limitations--what-phase-2-adds)
 
+### Phase 2 — Replica Architecture
+
+15. [internal/crdt — Type Scaffolding](#15-internalcrdt--type-scaffolding)
+16. [internal/replica/replica.go — The Replica](#16-internalreplicareplicago--the-replica)
+17. [Wiring: main.go, PEERS, and richer /status](#17-wiring-maingo-peers-and-richer-status)
+18. [Dockerfile & docker-compose.yml — The 3-Replica Cluster](#18-dockerfile--docker-composeyml--the-3-replica-cluster)
+19. [Phase 2 — Demo Output (Divergence Without Sync)](#19-phase-2--demo-output-divergence-without-sync)
+20. [Phase 2 — Known Limitations & What Phase 3 Adds](#20-phase-2--known-limitations--what-phase-3-adds)
+
 ---
 
 ## 1. Project Overview
@@ -504,5 +513,207 @@ later phase.
 vector clock — still *without* synchronization. That sets the stage for Phase 3,
 where the CRDT engine makes them converge.
 
-*Last updated: Phase 1 complete (single replica graph engine, REST API,
-race-clean). Next: Phase 2 multi-replica scaffolding.*
+---
+
+# Phase 2 — Replica Architecture
+
+**Goal:** stand up three independent replicas (`replica-a/b/c`) from one image
+via Docker Compose. Each has its own graph, its own (empty) operation log, and
+its own (zeroed) vector clock. **There is still no synchronization** — the point
+of this phase is to build the cluster topology and *demonstrate divergence*, so
+Phase 3's CRDT engine has something concrete to make converge.
+
+---
+
+## 15. `internal/crdt` — Type Scaffolding
+
+**Files:** `internal/crdt/vector_clock.go`, `internal/crdt/operation.go`
+
+Phase 2 introduces the `crdt` package, but **only the type definitions** — no
+merge behavior. This is a deliberate discipline: define the shapes the `Replica`
+struct and `/status` need now, defer all the logic to Phase 3 where it belongs.
+
+**`VectorClock` (`map[string]uint64`):**
+Maps each replica ID to how many operations that replica has originated, as
+observed here. It exists in Phase 2 purely so a fresh replica can report a
+complete, comparable clock (`a=0,b=0,c=0`). The behavior that matters —
+`Increment`, `Merge`, `Compare` — is Phase 3. The package comment restates the
+rule we corrected in the docs: **vector clocks are not used to merge state**
+(OR-Set tags and the HLC do that); they exist for anti-entropy diffs and
+concurrency detection.
+
+**`Operation` + `HLCTimestamp`:**
+`Operation` is the unit that *will* be logged and broadcast: an ID (for
+exactly-once application), origin replica, type, payload, plus the two pieces of
+causal metadata — a `VectorClock` and an `HLCTimestamp`. The op types
+(`create_node`, `rename_node`, …) map 1:1 onto the Phase 1 graph methods and the
+REST routes, so the wire model and the API already line up. `HLCTimestamp`
+captures the corrected design (physical, logical, replicaID) — definition now,
+`Now/Update/Compare` in Phase 3.
+
+**Why define these so early?**
+The `Replica` struct embeds a clock and an op log. If those were untyped
+placeholders, the Phase 3 refactor would churn the struct and everything reading
+it. Pinning the types now makes Phase 3 additive, not destructive.
+
+---
+
+## 16. `internal/replica/replica.go` — The Replica
+
+**File:** `internal/replica/replica.go`
+
+A `Replica` is the per-process unit of the cluster:
+
+```go
+type Replica struct {
+    ID    string
+    Peers []Peer        // {id, address} of the other replicas
+
+    Graph *graph.Graph  // the Phase 1 engine, unchanged
+
+    mu    sync.RWMutex
+    clock crdt.VectorClock   // zeroed in Phase 2
+    oplog []crdt.Operation   // empty in Phase 2
+}
+```
+
+**"Replica", not "node" — and every replica is equal.**
+The naming is the lesson: in a CRDT system there is no leader and no coordinator,
+so there is no special node. `New(id, peers)` seeds the vector clock with *itself
+plus every peer* at zero, so the clock is complete and comparable from the first
+millisecond.
+
+**The graph is untouched.**
+Phase 1's engine drops in as-is. The `Replica` *wraps* it rather than modifying
+it — separation of concerns paying off already. Phase 3 will intercept the graph
+mutations to emit operations, but the engine's core stays the same.
+
+**Its own `sync.RWMutex`.**
+The clock and op log get their own lock, independent of the graph's lock. They
+protect different state mutated on different paths (graph = REST writes; clock/log
+= operation generation in Phase 3). Two locks, two concerns — no false contention
+between reading the graph and reading the clock.
+
+**`Clock()` and `OpLogLen()`** return snapshots/counts for `/status`. In Phase 2
+they always report zeros — which is exactly the evidence that no operations are
+flowing.
+
+---
+
+## 17. Wiring: `main.go`, `PEERS`, and richer `/status`
+
+**Files:** `cmd/replica/main.go`, `internal/api/handlers.go`
+
+**`PEERS` env var — peer discovery without a registry.**
+Each replica learns its peers from a single env string:
+
+```
+PEERS="replica-b=http://replica-b:8080,replica-c=http://replica-c:8080"
+```
+
+`parsePeers` splits it into `{id, address}` pairs, skipping malformed entries. An
+empty `PEERS` means single-replica mode — Phase 1 behavior still works unchanged.
+This static config is enough for a fixed 3-replica cluster; dynamic membership
+isn't needed for the project's goals.
+
+**`NewHandler` now takes a `*replica.Replica`.**
+The handler reaches the graph via `r.Graph`, and `/status` now reports the full
+replica view:
+
+```json
+{
+  "replicaId": "replica-a",
+  "peers": [{"id":"replica-b","address":"..."}, ...],
+  "nodes": 2, "edges": 0,
+  "vectorClock": {"replica-a":0,"replica-b":0,"replica-c":0},
+  "opLogLen": 0
+}
+```
+
+This endpoint is the Phase 2 instrument: three replicas, three different
+`nodes`/`edges` counts, identical all-zero clocks — divergence made visible.
+No import cycle: `api → replica → {graph, crdt}`, and `replica` never imports
+`api`.
+
+---
+
+## 18. `Dockerfile` & `docker-compose.yml` — The 3-Replica Cluster
+
+**Files:** `Dockerfile`, `docker-compose.yml`
+
+**Multi-stage Dockerfile (same pattern as SentinelCache):**
+Stage 1 (the full `golang` image) compiles; stage 2 (bare `alpine`) carries only
+the binary. `COPY go.mod go.sum` before `COPY .` so the dependency layer is cached
+and only re-downloads when deps change. Final image: a few MB, no toolchain.
+
+**Compose — one image, three identities:**
+
+| Container | Host port | In-network |
+|---|---|---|
+| replica-a | 8080 | `:8080` |
+| replica-b | 8081 | `:8080` |
+| replica-c | 8082 | `:8080` |
+
+Every container listens on `:8080` inside Docker's network; the host port mapping
+just lets us `curl` each one. Each gets a different `REPLICA_ID` and a `PEERS`
+string naming the *other two* by their Docker hostnames.
+
+**`PEERS` recorded, not dialed.**
+This is the key Phase 2 caveat: the peer addresses are stored and shown in
+`/status`, but **no replica contacts another**. The addresses sit ready for
+Phase 4, when replicas open WebSocket connections to exactly these hosts.
+
+Makefile gains `docker-up` / `docker-down` / `docker-logs`.
+
+---
+
+## 19. Phase 2 — Demo Output (Divergence Without Sync)
+
+`make docker-up`, then drive the three replicas independently:
+
+```
+== all three status (empty, independent) ==
+:8080 → nodes:0 edges:0 clock:{a:0,b:0,c:0} peers:[b,c]
+:8081 → nodes:0 edges:0 clock:{a:0,b:0,c:0} peers:[a,c]
+:8082 → nodes:0 edges:0 clock:{a:0,b:0,c:0} peers:[a,b]
+
+== write 2 nodes to replica-a, 1 node to replica-b, nothing to replica-c ==
+POST :8080/node {id:1,Email}   POST :8080/node {id:2,AI}
+POST :8081/node {id:9,OnlyOnB}
+
+== resulting state — they DIVERGE, because nothing syncs ==
+replica-a → nodes:2
+replica-b → nodes:1
+replica-c → nodes:0
+
+replica-a /graph → [Email, AI]
+replica-c /graph → []          ← never heard about any write
+```
+
+This is the whole Phase 2 story in one screen: **three replicas, three different
+states, and they stay that way.** The vector clocks all read zero because no
+*operations* are generated yet (Phase 3) — `opLogLen` is `0` everywhere. The
+divergence here is precisely what the CRDT engine + replication will erase in
+Phases 3–4, and the convergence checker will *prove* erased.
+
+---
+
+## 20. Phase 2 — Known Limitations & What Phase 3 Adds
+
+| Limitation (by design) | Removed in |
+|---|---|
+| Replicas never communicate (`PEERS` recorded, not dialed) | Phase 4 (WebSocket replication) |
+| Vector clock always zero, op log always empty | Phase 3 (mutations emit operations) |
+| Writes to different replicas diverge permanently | Phase 3 + 4 (CRDT merge + sync) |
+| Plain graph fields clobber on concurrent edits | Phase 3 (OR-Set + HLC-LWW) |
+| State in-memory; container restart loses it | persistent log is a V2 item |
+
+**Next: Phase 3 — the CRDT Engine.** This is the core. Wrap node/edge presence in
+an **OR-Set**, wrap title/position in an **HLC-ordered LWW register**, make every
+graph mutation emit an `Operation` that advances the **vector clock** and appends
+to the log, and build the **convergence checker** (canonical state hash) as the
+test oracle — before any networking. By the end of Phase 3 two replicas fed the
+same operations in any order must produce identical state hashes.
+
+*Last updated: Phase 2 complete (3 independent replicas via Docker Compose,
+peer-aware, divergence demonstrated, race-clean). Next: Phase 3 CRDT engine.*
