@@ -25,9 +25,17 @@ plumbing. See [`docs/`](docs) for the blueprint, system design, and phased plan.
   **convergence hash** (`stateHash` in `/status`) is the test oracle. Dangling
   edges are filtered at materialization. Convergence is proven by tests; ops are
   hand-fed (no transport yet).
+- **Phase 4 — Replication Layer (done).** Each replica now has a WebSocket
+  transport (`internal/transport`) that **broadcasts** every locally-generated
+  operation to all peers (fast path) and runs an **anti-entropy** loop — periodic
+  vector-clock diffs that replay any ops a peer missed (reliability backstop). A
+  **gap-aware vector clock** (`recordSeq`) tracks only the contiguous prefix of
+  each origin's sequence, so a dropped op triggers a re-request rather than being
+  silently skipped. The 3-replica Docker cluster converges to an identical
+  `stateHash` within milliseconds of a write. All tests pass with `-race`.
 
-Roadmap: **Phase 4** replication + anti-entropy → 5 network simulation → 6
-simulated users → 7 dashboard → 8 replay / time travel.
+Roadmap: **Phase 5** network simulation (drop/delay/partition) → 6 simulated users
+→ 7 dashboard → 8 replay / time travel.
 
 ## Quick start
 
@@ -40,7 +48,7 @@ make docker-up   # start the 3-replica cluster (a:8080, b:8081, c:8082)
 make docker-down # stop it
 ```
 
-### REST API (Phase 1)
+### REST + WebSocket API
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -53,5 +61,6 @@ make docker-down # stop it
 | `DELETE` | `/node/:id` | Delete node (no cascade; edges dangle and are filtered) |
 | `POST` | `/edge` | Create edge `{id,source,target}` (dangling allowed) |
 | `DELETE` | `/edge/:id` | Delete edge |
+| `GET` (WS) | `/ws` | Peer-to-peer replication endpoint (Phase 4) |
 
 Build narrative and per-file rationale live in [`DEVLOG.md`](DEVLOG.md).
