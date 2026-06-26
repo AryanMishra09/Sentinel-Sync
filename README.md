@@ -14,20 +14,25 @@ plumbing. See [`docs/`](docs) for the blueprint, system design, and phased plan.
 
 ## Status
 
-**Phase 1 — Single Replica (done).** A standalone in-memory graph engine behind a
-REST API. No networking, no CRDT yet. This is the local state model every later
-phase makes convergent.
+- **Phase 1 — Single Replica (done).** Standalone in-memory graph engine behind a
+  REST API. No networking, no CRDT.
+- **Phase 2 — Replica Architecture (done).** Three independent replicas
+  (`replica-a/b/c`) via Docker Compose, each peer-aware but with **no sync** —
+  divergence is demonstrable. Scaffolds the `crdt` types and the `Replica` struct.
 
-Roadmap: Phase 2 multi-replica → 3 CRDT engine (OR-Set, HLC-LWW, vector clocks,
-convergence checker) → 4 replication + anti-entropy → 5 network simulation →
-6 simulated users → 7 dashboard → 8 replay / time travel.
+Roadmap: **Phase 3** CRDT engine (OR-Set, HLC-LWW, vector clocks, convergence
+checker) → 4 replication + anti-entropy → 5 network simulation → 6 simulated
+users → 7 dashboard → 8 replay / time travel.
 
 ## Quick start
 
 ```bash
-make run        # start one replica on :8080
-make test       # run tests with the race detector
-make build      # compile to bin/replica
+make run         # start one replica on :8080
+make test        # run tests with the race detector
+make build       # compile to bin/replica
+
+make docker-up   # start the 3-replica cluster (a:8080, b:8081, c:8082)
+make docker-down # stop it
 ```
 
 ### REST API (Phase 1)
