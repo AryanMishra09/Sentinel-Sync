@@ -48,6 +48,17 @@ asked *"how does a cluster stay available when nodes die?"*, SentinelSync asks
 29. [Phase 3 — Demo Output (Dangling Edge Round-Trip)](#29-phase-3--demo-output-dangling-edge-round-trip)
 30. [Phase 3 — Known Limitations & What Phase 4 Adds](#30-phase-3--known-limitations--what-phase-4-adds)
 
+### Phase 4 — Replication Layer
+
+31. [The Reliability Problem With Op-Based CRDTs](#31-the-reliability-problem-with-op-based-crdts)
+32. [internal/transport/transport.go — The WebSocket Manager](#32-internaltransporttransportgo--the-websocket-manager)
+33. [internal/replica/replica.go — Gap-Aware Vector Clock](#33-internalreplicareplicago--gap-aware-vector-clock)
+34. [internal/transport/transport_test.go — Live Convergence Tests](#34-internaltransporttransport_testgo--live-convergence-tests)
+35. [internal/replica/replica_test.go — Anti-Entropy Gap-Aware Test](#35-internalreplicareplica_testgo--anti-entropy-gap-aware-test)
+36. [Wiring: cmd/replica/main.go + go.mod](#36-wiring-cmdreplicamaingo--gomod)
+37. [Phase 4 — Demo Output (Live 3-Replica Convergence)](#37-phase-4--demo-output-live-3-replica-convergence)
+38. [Phase 4 — Known Limitations & What Phase 5 Adds](#38-phase-4--known-limitations--what-phase-5-adds)
+
 ---
 
 ## 1. Project Overview
@@ -1004,6 +1015,321 @@ plus the anti-entropy loop that uses the vector-clock diff to recover operations
 lost to latency or partition. After Phase 4 the convergence proven here happens
 live, over the network — and `syncAll` gets replaced by real wires.
 
-*Last updated: Phase 3 complete (CRDT engine — OR-Set, HLC-LWW, vector clocks,
-convergence checker; convergence proven by tests + live dangling-edge demo;
-race-clean). Next: Phase 4 replication + anti-entropy.*
+*Last updated: Phase 3 complete.*
+
+---
+
+# Phase 4 — Replication Layer
+
+**Goal:** make convergence happen *live*, over real WebSocket connections between
+Docker containers. Phase 3 proved that the same set of operations produces the
+same state hash regardless of order. Phase 4 delivers those operations over the
+wire — with a broadcast fast path and an anti-entropy backstop that recovers
+anything the fast path missed.
+
+At the end of this phase the three-replica Docker cluster is running. Writing to
+any one replica causes all three to converge to an identical `stateHash` within
+milliseconds. The `syncAll` test helper that hand-fed operations in Phase 3 tests
+is now real wires.
+
+---
+
+## 31. The Reliability Problem With Op-Based CRDTs
+
+State-based CRDTs (like a G-Counter or OR-Set) are trivially replicated: just
+send the full state, merge. The tradeoff is that every sync payload is the full
+state — fine for small registers, brutal for a growing graph.
+
+Op-based CRDTs are better on bandwidth: instead of shipping the full OR-Set, you
+ship a three-byte `{op: "add", elem: "n1", tag: {a, 1}}`. But they require every
+operation to be delivered to every replica *exactly once and in causal order*.
+Miss one operation and the state silently diverges.
+
+That guarantee is easy on a single machine (`syncAll` in tests) and impossible to
+promise on a real network. So Phase 4 uses a **hybrid**:
+
+| Layer | What it does | Delivery promise |
+|---|---|---|
+| Broadcast | Push each new op to all peers immediately | Best-effort, once |
+| Anti-entropy | Periodic clock diff → replay what peer missed | Eventually all ops |
+| Ingest dedup | Operation IDs make retransmits harmless | Exactly-once apply |
+
+Broadcast gets convergence in milliseconds when nothing is dropped. Anti-entropy
+guarantees convergence eventually, no matter what. Dedup makes the two paths
+composable — anti-entropy can re-send what broadcast already delivered and no
+damage is done.
+
+---
+
+## 32. `internal/transport/transport.go` — The WebSocket Manager
+
+**File:** `internal/transport/transport.go`
+
+The entire peer-to-peer layer lives here. One `Manager` per replica process.
+
+**Wire format:**
+
+```go
+type message struct {
+    Type  msgType          // "op" | "sync_request" | "sync_response"
+    Op    *crdt.Operation  // set for msgOp
+    Clock crdt.VectorClock // set for msgSyncReq
+    Ops   []crdt.Operation // set for msgSyncResp
+}
+```
+
+Three message types cover everything:
+
+| Message | Sender | Payload | Receiver action |
+|---|---|---|---|
+| `op` | Any replica | One operation | `Ingest` it |
+| `sync_request` | Any replica | My current vector clock | Compute `MissingFor(clock)`, reply with `sync_response` |
+| `sync_response` | Responding peer | Slice of missing ops | `Ingest` each |
+
+**Topology — full mesh:**
+
+Each replica dials every peer (`dialLoop`). Inbound connections land at `HandleWS`. Operations are never relayed — a replica applies what it receives but does not re-broadcast; dedup and anti-entropy close any gap a direct link missed.
+
+**`peerConn` write mutex:**
+
+`gorilla/websocket` forbids concurrent writes on one connection. Broadcast,
+anti-entropy, and sync replies can all fire on the same connection simultaneously,
+so every connection is wrapped in a `peerConn{mu sync.Mutex, ws}` and all writes
+go through `pc.write(v)` which holds the mutex.
+
+**Reconnect loop:**
+
+`dialLoop` reconnects every 2 s after a lost connection. On each fresh connection
+it immediately sends a `sync_request` with the current clock — so a replica that
+missed messages while disconnected catches up before the next anti-entropy tick
+even fires.
+
+**Anti-entropy loop:**
+
+A 3-second ticker sends a `sync_request` (current clock) to every connected peer.
+Each peer runs `MissingFor(clock)` and replies with any operations the sender
+lacks. This is the backstop that prevents permanent divergence from dropped
+packets or partitions.
+
+**Broadcast outside the lock:**
+
+```go
+// emit() in replica.go:
+bc := r.broadcast   // captured under r.mu
+r.mu.Unlock()
+if bc != nil {
+    bc(op)          // called WITHOUT r.mu held
+}
+```
+
+A slow peer write (blocked network, full buffer) must never stall a local
+mutation. If broadcast held the replica lock, any client request that generated
+an operation would block until the transport finished writing to every peer —
+turning a network problem into an API availability problem. Capturing `bc` then
+releasing the lock before calling it keeps the two concerns independent.
+
+---
+
+## 33. `internal/replica/replica.go` — Gap-Aware Vector Clock
+
+**File:** `internal/replica/replica.go` (additions in Phase 4)
+
+The replica's vector clock tracks the **highest *contiguous* sequence received
+from each origin**, not the maximum. This is the `recordSeq` function:
+
+```go
+func (r *Replica) recordSeq(origin string, seq uint64) {
+    r.seen[origin][seq] = true
+    for r.seen[origin][r.clock[origin]+1] {
+        r.clock[origin]++
+    }
+}
+```
+
+**Why contiguous and not max?**
+
+Suppose peer A has emitted ops `a-1`, `a-2`, `a-3`. You receive `a-1` and `a-3`
+but `a-2` is dropped:
+
+- **Max-merge:** `clock["a"] = 3`. When A asks *"what do you need?"*, you reply
+  `{a: 3}`. A computes `MissingFor({a:3})` and returns nothing — it thinks you
+  have everything up to 3. `a-2` is lost forever.
+- **Contiguous-advance:** `clock["a"] = 1` (the `seen` set has 3 but the
+  contiguous run only reaches 1). You reply `{a: 1}`. A returns ops for sequences
+  `> 1` — including `a-2`. Convergence recovered.
+
+The `seen map[string]map[uint64]bool` records every sequence received; the loop
+in `recordSeq` advances the clock only as far as the contiguous prefix allows.
+
+**`MissingFor`:**
+
+```go
+for _, op := range r.oplog {
+    if op.VectorClock[op.ReplicaID] > peerClock[op.ReplicaID] {
+        out = append(out, op)
+    }
+}
+```
+
+Each operation carries the clock value it was generated at (`op.VectorClock[origin]`). If that value is above what the peer has contiguously seen, the peer needs it.
+
+---
+
+## 34. `internal/transport/transport_test.go` — Live Convergence Tests
+
+**File:** `internal/transport/transport_test.go`
+
+Two integration tests exercise the full transport stack with real gorilla/websocket
+connections — not mocks, not channels, real TCP.
+
+**`TestLiveBroadcastConverges`**
+
+Creates two replicas each behind an `httptest.Server`. Connects them. Waits for
+the mesh to come up (polls until both sides have an outbound connection). Then
+writes 2 nodes + 1 edge on A and asserts that `a.Hash() == b.Hash()` within 2 s.
+This validates the fast path: broadcast delivers fresh ops immediately.
+
+**`TestAntiEntropyCatchUp`**
+
+Creates state on A *before* B exists anywhere near it (so broadcast can't deliver
+anything). Then connects A and B. Asserts convergence within 5 s.
+This validates the backstop: only the anti-entropy sync_request/sync_response
+exchange can recover the pre-connection state. If the 3 s ticker fires once and
+the response is applied, B catches up.
+
+**Test infrastructure:**
+
+```go
+type node struct {
+    rep    *replica.Replica
+    mgr    *Manager
+    server *httptest.Server
+    cancel context.CancelFunc
+}
+```
+
+`startNode` builds a replica + manager + httptest server in one call. `connect`
+sets the peer list and starts the transport goroutines. `eventually` polls a
+condition with 20 ms sleep intervals up to a deadline — the convergence predicate
+is just `a.Hash() == b.Hash()`.
+
+**Race detector:** both tests pass under `-race`. The mutex discipline in
+`peerConn`, `Manager.outbound`, and `Replica` are all exercised by real concurrent
+goroutines here — the race detector gives confidence the locking is correct.
+
+---
+
+## 35. `internal/replica/replica_test.go` — Anti-Entropy Gap-Aware Test
+
+**File:** `internal/replica/replica_test.go` (Phase 4 addition)
+
+**`TestAntiEntropyGapAware`** is a pure unit test (no networking) that verifies
+the contiguous clock behavior in isolation:
+
+1. A emits ops `a-1`, `a-2`, `a-3`.
+2. B receives `a-1` and `a-3` but NOT `a-2`.
+3. Assert `b.Clock()["a"] == 1` — the gap is not skipped.
+4. Call `a.MissingFor(b.Clock())` — assert `a-2` is in the result.
+5. Apply the missing ops to B. Assert `a.Hash() == b.Hash()` and
+   `b.Clock()["a"] == 3`.
+
+This test exists separately from the transport tests because it isolates the
+clock algorithm from networking. If `recordSeq` ever regresses to a max-merge,
+this test catches it without needing WebSocket connections.
+
+---
+
+## 36. Wiring: `cmd/replica/main.go` + `go.mod`
+
+**Phase 4 changes to existing files.**
+
+**`cmd/replica/main.go`:**
+
+```go
+mgr := transport.NewManager(r)
+go mgr.Start(context.Background())
+// ...
+engine.GET("/ws", gin.WrapF(mgr.HandleWS))
+```
+
+Three lines. `NewManager` registers itself as the replica's broadcaster
+(`r.SetBroadcast(m.Broadcast)`), so from this point forward every locally
+generated operation is automatically pushed to peers. `Start` dials all peers
+and runs the anti-entropy loop in the background. `/ws` is where inbound peer
+connections land — Gin's `WrapF` bridges the standard `http.HandlerFunc` to
+Gin's handler.
+
+**`go.mod`:**
+
+`github.com/gorilla/websocket v1.5.3` added via `go mod tidy` after
+`transport.go` was written. The module was already de facto selected by
+indirect dep — `go mod tidy` just made it explicit.
+
+---
+
+## 37. Phase 4 — Demo Output (Live 3-Replica Convergence)
+
+Three Docker containers, full-mesh WebSocket topology.
+
+```
+docker compose up --build -d
+```
+
+All three come up, each dials both peers, anti-entropy tickers start.
+
+**Initial state — all identical (empty graph):**
+
+```json
+replica-a: { nodes:0, edges:0, stateHash:"e3b0c44…", vectorClock:{a:0,b:0,c:0} }
+replica-b: { nodes:0, edges:0, stateHash:"e3b0c44…", vectorClock:{a:0,b:0,c:0} }
+replica-c: { nodes:0, edges:0, stateHash:"e3b0c44…", vectorClock:{a:0,b:0,c:0} }
+```
+
+`e3b0c44…` is SHA-256 of the empty string — the canonical empty-graph hash.
+
+**Concurrent writes — A gets 2 nodes + 1 edge, C gets 1 node:**
+
+```
+POST localhost:8080/node  {"id":"n1","title":"Email",...}
+POST localhost:8080/node  {"id":"n2","title":"AI",...}
+POST localhost:8080/edge  {"id":"e1","source":"n1","target":"n2"}
+POST localhost:8082/node  {"id":"n3","title":"Slack",...}
+```
+
+**Status 2 s later — all three replicas converged:**
+
+```json
+replica-a: { nodes:3, edges:1, opLogLen:4, stateHash:"f2fdb135…",
+             vectorClock:{a:3, b:0, c:1} }
+replica-b: { nodes:3, edges:1, opLogLen:4, stateHash:"f2fdb135…",
+             vectorClock:{a:3, b:0, c:1} }
+replica-c: { nodes:3, edges:1, opLogLen:4, stateHash:"f2fdb135…",
+             vectorClock:{a:3, b:0, c:1} }
+```
+
+All three `stateHash` values are identical — `f2fdb135…` — despite the writes
+landing on different replicas with no coordination. The vector clock shows
+`a:3, c:1`: A generated 3 ops, C generated 1, B generated nothing but holds all
+4 (opLogLen:4). This is the Phase 3 convergence proof running live over real TCP.
+
+---
+
+## 38. Phase 4 — Known Limitations & What Phase 5 Adds
+
+| Limitation (by design) | Removed in |
+|---|---|
+| Network is perfect (Docker overlay, no loss) | Phase 5 (network simulation — drop / delay / partition) |
+| Anti-entropy recovery only tested at init | Phase 5 (mid-run partition + reconnect scenario) |
+| No back-pressure on broadcast (slow peer blocks its own goroutine) | V2 |
+| Tombstones and op log grow unbounded | V2 (causal-stability GC) |
+| State in-memory; container restart loses history | V2 (persistent op log) |
+
+**Next: Phase 5 — Network Simulation.** Add a chaos layer that can drop, delay,
+reorder, or partition individual replica links at runtime via the REST API. With
+that in place we can demonstrate the full resilience story: partition two replicas,
+keep writing on both sides, restore the link, watch the anti-entropy backstop
+collapse the divergent state hashes back to one value. That is the interview demo.
+
+*Last updated: Phase 4 complete (WebSocket replication — broadcast fast path,
+anti-entropy backstop, gap-aware vector clock; all tests race-clean; live
+3-replica Docker convergence verified).*

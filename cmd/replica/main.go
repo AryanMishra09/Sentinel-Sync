@@ -8,12 +8,14 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"strings"
 
 	"github.com/aryan-mishra/sentinel-sync/internal/api"
 	"github.com/aryan-mishra/sentinel-sync/internal/replica"
+	"github.com/aryan-mishra/sentinel-sync/internal/transport"
 	"github.com/gin-gonic/gin"
 )
 
@@ -25,10 +27,15 @@ func main() {
 	r := replica.New(replicaID, peers, nil) // nil → real wall clock for the HLC
 	h := api.NewHandler(r)
 
+	// Replica-to-replica WebSocket transport: broadcast + anti-entropy.
+	mgr := transport.NewManager(r)
+	go mgr.Start(context.Background())
+
 	engine := gin.Default()
 	h.RegisterRoutes(engine)
+	engine.GET("/ws", gin.WrapF(mgr.HandleWS)) // peer connections land here
 
-	log.Printf("[%s] SentinelSync replica on %s — %d peer(s) known, CRDT engine active, no transport yet (Phase 3)",
+	log.Printf("[%s] SentinelSync replica on %s — %d peer(s), CRDT engine + WebSocket replication active (Phase 4)",
 		replicaID, restAddr, len(peers))
 	if err := engine.Run(restAddr); err != nil {
 		log.Fatalf("[%s] server error: %v", replicaID, err)

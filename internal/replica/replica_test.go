@@ -111,6 +111,54 @@ func TestConcurrentCreateDeleteAddWins(t *testing.T) {
 	}
 }
 
+// MissingFor returns exactly the operations a peer hasn't seen, and the clock
+// advances only contiguously so a gap is re-requested rather than skipped.
+func TestAntiEntropyGapAware(t *testing.T) {
+	a := newReplica("a", 1000)
+	a.CreateNode("1", "n1", 0, 0) // a-1
+	a.CreateNode("2", "n2", 0, 0) // a-2
+	a.CreateNode("3", "n3", 0, 0) // a-3
+	ops := a.OpLog()
+
+	b := newReplica("b", 2000)
+	// Deliver a-1 and a-3 but DROP a-2 (a gap).
+	b.Ingest(ops[0])
+	b.Ingest(ops[2])
+
+	// b's contiguous clock for "a" must be 1, not 3 — the gap is not skipped.
+	if got := b.Clock()["a"]; got != 1 {
+		t.Fatalf("expected contiguous clock a=1 after gap, got %d", got)
+	}
+
+	// a's anti-entropy reply to b must include the missing a-2 (and a-3, already
+	// held — dedup makes the resend harmless).
+	missing := a.MissingFor(b.Clock())
+	var ids []string
+	for _, op := range missing {
+		ids = append(ids, op.ID)
+	}
+	foundGap := false
+	for _, id := range ids {
+		if id == "a-2" {
+			foundGap = true
+		}
+	}
+	if !foundGap {
+		t.Fatalf("anti-entropy must re-offer the dropped op a-2, got %v", ids)
+	}
+
+	// After applying the diff, b converges with a.
+	for _, op := range missing {
+		b.Ingest(op)
+	}
+	if a.Hash() != b.Hash() {
+		t.Fatalf("did not converge after gap recovery: a=%s b=%s", a.Hash(), b.Hash())
+	}
+	if b.Clock()["a"] != 3 {
+		t.Fatalf("clock should reach a=3 after recovery, got %d", b.Clock()["a"])
+	}
+}
+
 // Ingest is idempotent: applying the same operation twice changes nothing.
 func TestIngestIdempotent(t *testing.T) {
 	a := newReplica("a", 1000)

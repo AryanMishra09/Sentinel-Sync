@@ -41,10 +41,13 @@ type Replica struct {
 	state *graph.State
 	hlc   *crdt.HLC
 
-	mu      sync.Mutex // guards clock, oplog, applied
-	clock   crdt.VectorClock
+	mu      sync.Mutex // guards clock, oplog, applied, seen
+	clock   crdt.VectorClock // highest *contiguous* applied seq per origin
 	oplog   []crdt.Operation
-	applied map[string]bool
+	applied map[string]bool             // op ID -> applied (dedup)
+	seen    map[string]map[uint64]bool  // origin -> set of applied seqs (gap fill)
+
+	broadcast func(crdt.Operation) // set by the transport; nil until Phase 4 wiring
 }
 
 // New builds a replica with an empty CRDT graph and a zeroed vector clock seeded
@@ -63,6 +66,33 @@ func New(id string, peers []Peer, now func() int64) *Replica {
 		hlc:     crdt.NewHLC(id, now),
 		clock:   crdt.New(ids...),
 		applied: make(map[string]bool),
+		seen:    make(map[string]map[uint64]bool),
+	}
+}
+
+// SetBroadcast registers the function the replica calls with every locally
+// generated operation (the transport's broadcast). Safe to leave nil — then
+// operations are simply not propagated (Phase 3 behavior).
+func (r *Replica) SetBroadcast(fn func(crdt.Operation)) {
+	r.mu.Lock()
+	r.broadcast = fn
+	r.mu.Unlock()
+}
+
+// recordSeq marks (origin, seq) as applied and advances the contiguous clock for
+// that origin as far as the seen set allows. Caller holds r.mu.
+//
+// Tracking the highest *contiguous* sequence (not the max) is what makes
+// anti-entropy gap-robust: if op #3 from a peer is lost but #4 arrives, the clock
+// stays at 2, so a later sync correctly re-requests #3 — a plain max-merge would
+// skip it forever.
+func (r *Replica) recordSeq(origin string, seq uint64) {
+	if r.seen[origin] == nil {
+		r.seen[origin] = make(map[uint64]bool)
+	}
+	r.seen[origin][seq] = true
+	for r.seen[origin][r.clock[origin]+1] {
+		r.clock[origin]++
 	}
 }
 
@@ -73,25 +103,33 @@ func New(id string, peers []Peer, now func() int64) *Replica {
 // others ignore it).
 func (r *Replica) emit(typ crdt.OpType, build func(crdt.Tag) any) crdt.Operation {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
-	r.clock.Increment(r.ID)
-	counter := r.clock[r.ID]
+	counter := r.clock[r.ID] + 1
 	ts := r.hlc.Now()
 	tag := crdt.Tag{ReplicaID: r.ID, Counter: counter}
 
 	payload := mustMarshal(build(tag))
 	op := crdt.Operation{
-		ID:          fmt.Sprintf("%s-%d", r.ID, counter),
-		ReplicaID:   r.ID,
-		Type:        typ,
-		Payload:     payload,
-		VectorClock: r.clock.Snapshot(),
-		HLC:         ts,
+		ID:        fmt.Sprintf("%s-%d", r.ID, counter),
+		ReplicaID: r.ID,
+		Type:      typ,
+		Payload:   payload,
 	}
 	r.applied[op.ID] = true
+	r.recordSeq(r.ID, counter) // advances clock[self] contiguously
+	op.VectorClock = r.clock.Snapshot()
+	op.HLC = ts
 	r.oplog = append(r.oplog, op)
 	_ = r.state.Apply(op) // local payloads are always well-formed
+
+	bc := r.broadcast
+	r.mu.Unlock()
+
+	// Broadcast outside the lock so a slow/blocked transport never stalls local
+	// mutations or risks a lock-order inversion.
+	if bc != nil {
+		bc(op)
+	}
 	return op
 }
 
@@ -173,10 +211,30 @@ func (r *Replica) Ingest(op crdt.Operation) {
 		return
 	}
 	r.applied[op.ID] = true
-	r.clock.Merge(op.VectorClock)
+	// The op's own sequence at its origin is that origin's component of the
+	// snapshot taken when it was generated.
+	r.recordSeq(op.ReplicaID, op.VectorClock[op.ReplicaID])
 	r.hlc.Update(op.HLC)
 	r.oplog = append(r.oplog, op)
 	_ = r.state.Apply(op)
+}
+
+// MissingFor returns the operations this replica holds that the peer (described
+// by peerClock) has not yet seen — the anti-entropy diff. It is the responder
+// side of the sync protocol: for each operation, if its origin sequence exceeds
+// what the peer has contiguously seen from that origin, the peer needs it.
+func (r *Replica) MissingFor(peerClock crdt.VectorClock) []crdt.Operation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var out []crdt.Operation
+	for _, op := range r.oplog {
+		origin := op.ReplicaID
+		if op.VectorClock[origin] > peerClock[origin] {
+			out = append(out, op)
+		}
+	}
+	return out
 }
 
 // --- Reads -----------------------------------------------------------------
