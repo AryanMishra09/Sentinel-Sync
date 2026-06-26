@@ -1,9 +1,8 @@
 // Package api is the client-facing REST layer for a replica.
 //
-// Like SentinelCache, the split is deliberate: REST (Gin) faces clients and the
-// dashboard because it is human-readable and curl-friendly; replica-to-replica
-// traffic (added in Phase 4) will use a separate transport. Gin never sees a
-// replication message.
+// REST (Gin) faces clients and the dashboard because it is human-readable and
+// curl-friendly; replica-to-replica traffic (Phase 4) will use a separate
+// transport. Each handler maps to one CRDT operation on the replica.
 package api
 
 import (
@@ -18,12 +17,11 @@ import (
 // Handler wires HTTP requests to one replica.
 type Handler struct {
 	replica *replica.Replica
-	graph   *graph.Graph
 }
 
-// NewHandler builds a handler bound to a replica (and its graph).
+// NewHandler builds a handler bound to a replica.
 func NewHandler(r *replica.Replica) *Handler {
-	return &Handler{replica: r, graph: r.Graph}
+	return &Handler{replica: r}
 }
 
 // --- request bodies --------------------------------------------------------
@@ -58,11 +56,11 @@ func (h *Handler) handleCreateNode(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	n, err := h.graph.CreateNode(req.ID, req.Title, req.X, req.Y)
-	if err != nil {
+	if _, err := h.replica.CreateNode(req.ID, req.Title, req.X, req.Y); err != nil {
 		h.writeErr(c, err)
 		return
 	}
+	n, _ := h.replica.Node(req.ID)
 	c.JSON(http.StatusCreated, n)
 }
 
@@ -72,11 +70,12 @@ func (h *Handler) handleRenameNode(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	n, err := h.graph.RenameNode(c.Param("id"), req.Title)
-	if err != nil {
+	id := c.Param("id")
+	if _, err := h.replica.RenameNode(id, req.Title); err != nil {
 		h.writeErr(c, err)
 		return
 	}
+	n, _ := h.replica.Node(id)
 	c.JSON(http.StatusOK, n)
 }
 
@@ -86,16 +85,17 @@ func (h *Handler) handleMoveNode(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	n, err := h.graph.MoveNode(c.Param("id"), req.X, req.Y)
-	if err != nil {
+	id := c.Param("id")
+	if _, err := h.replica.MoveNode(id, req.X, req.Y); err != nil {
 		h.writeErr(c, err)
 		return
 	}
+	n, _ := h.replica.Node(id)
 	c.JSON(http.StatusOK, n)
 }
 
 func (h *Handler) handleDeleteNode(c *gin.Context) {
-	if err := h.graph.DeleteNode(c.Param("id")); err != nil {
+	if _, err := h.replica.DeleteNode(c.Param("id")); err != nil {
 		h.writeErr(c, err)
 		return
 	}
@@ -108,16 +108,18 @@ func (h *Handler) handleCreateEdge(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	e, err := h.graph.CreateEdge(req.ID, req.Source, req.Target)
-	if err != nil {
+	// Note: no endpoint validation. A dangling edge is allowed by the CRDT and
+	// filtered at materialization, so the echoed edge may not appear in /graph
+	// until both endpoints exist.
+	if _, err := h.replica.CreateEdge(req.ID, req.Source, req.Target); err != nil {
 		h.writeErr(c, err)
 		return
 	}
-	c.JSON(http.StatusCreated, e)
+	c.JSON(http.StatusCreated, gin.H{"id": req.ID, "source": req.Source, "target": req.Target})
 }
 
 func (h *Handler) handleDeleteEdge(c *gin.Context) {
-	if err := h.graph.DeleteEdge(c.Param("id")); err != nil {
+	if _, err := h.replica.DeleteEdge(c.Param("id")); err != nil {
 		h.writeErr(c, err)
 		return
 	}
@@ -125,11 +127,11 @@ func (h *Handler) handleDeleteEdge(c *gin.Context) {
 }
 
 func (h *Handler) handleGetGraph(c *gin.Context) {
-	c.JSON(http.StatusOK, h.graph.Snapshot())
+	c.JSON(http.StatusOK, h.replica.Snapshot())
 }
 
 func (h *Handler) handleStatus(c *gin.Context) {
-	nodes, edges := h.graph.Counts()
+	nodes, edges := h.replica.Counts()
 	c.JSON(http.StatusOK, gin.H{
 		"replicaId":   h.replica.ID,
 		"peers":       h.replica.Peers,
@@ -137,6 +139,8 @@ func (h *Handler) handleStatus(c *gin.Context) {
 		"edges":       edges,
 		"vectorClock": h.replica.Clock(),
 		"opLogLen":    h.replica.OpLogLen(),
+		"tombstones":  h.replica.TombstoneCount(),
+		"stateHash":   h.replica.Hash(),
 	})
 }
 
@@ -147,8 +151,6 @@ func (h *Handler) writeErr(c *gin.Context, err error) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 	case errors.Is(err, graph.ErrNodeExists), errors.Is(err, graph.ErrEdgeExists):
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-	case errors.Is(err, graph.ErrEndpointMissing):
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 	}

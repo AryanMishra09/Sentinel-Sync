@@ -19,10 +19,15 @@ plumbing. See [`docs/`](docs) for the blueprint, system design, and phased plan.
 - **Phase 2 — Replica Architecture (done).** Three independent replicas
   (`replica-a/b/c`) via Docker Compose, each peer-aware but with **no sync** —
   divergence is demonstrable. Scaffolds the `crdt` types and the `Replica` struct.
+- **Phase 3 — CRDT Engine (done).** State is now convergent: node/edge presence is
+  an **OR-Set** (add-wins), title/position are **HLC-ordered LWW registers**, every
+  mutation emits an **operation** that advances a **vector clock**, and a
+  **convergence hash** (`stateHash` in `/status`) is the test oracle. Dangling
+  edges are filtered at materialization. Convergence is proven by tests; ops are
+  hand-fed (no transport yet).
 
-Roadmap: **Phase 3** CRDT engine (OR-Set, HLC-LWW, vector clocks, convergence
-checker) → 4 replication + anti-entropy → 5 network simulation → 6 simulated
-users → 7 dashboard → 8 replay / time travel.
+Roadmap: **Phase 4** replication + anti-entropy → 5 network simulation → 6
+simulated users → 7 dashboard → 8 replay / time travel.
 
 ## Quick start
 
@@ -40,13 +45,13 @@ make docker-down # stop it
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness |
-| `GET` | `/status` | Replica ID + node/edge counts |
-| `GET` | `/graph` | Full graph snapshot |
+| `GET` | `/status` | Replica id, peers, counts, vector clock, `stateHash`, tombstones |
+| `GET` | `/graph` | Materialized graph snapshot (dangling edges filtered) |
 | `POST` | `/node` | Create node `{id,title,x,y}` |
-| `PATCH` | `/node/:id/title` | Rename `{title}` |
-| `PATCH` | `/node/:id/position` | Move `{x,y}` |
-| `DELETE` | `/node/:id` | Delete node (cascades its edges) |
-| `POST` | `/edge` | Create edge `{id,source,target}` |
+| `PATCH` | `/node/:id/title` | Rename `{title}` (LWW) |
+| `PATCH` | `/node/:id/position` | Move `{x,y}` (LWW) |
+| `DELETE` | `/node/:id` | Delete node (no cascade; edges dangle and are filtered) |
+| `POST` | `/edge` | Create edge `{id,source,target}` (dangling allowed) |
 | `DELETE` | `/edge/:id` | Delete edge |
 
 Build narrative and per-file rationale live in [`DEVLOG.md`](DEVLOG.md).

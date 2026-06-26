@@ -42,6 +42,66 @@ func (vc VectorClock) Snapshot() VectorClock {
 	return out
 }
 
+// Increment bumps this replica's own component by one. Called once per locally
+// generated operation.
+func (vc VectorClock) Increment(replicaID string) {
+	vc[replicaID]++
+}
+
+// Merge takes the element-wise maximum of two clocks into the receiver. This is
+// how a replica folds in everything a peer has seen.
+func (vc VectorClock) Merge(other VectorClock) {
+	for id, v := range other {
+		if v > vc[id] {
+			vc[id] = v
+		}
+	}
+}
+
+// Ordering is the causal relationship between two events as told by their vector
+// clocks.
+type Ordering int
+
+const (
+	Before     Ordering = iota // receiver happened strictly before other
+	After                      // receiver happened strictly after other
+	Equal                      // identical clocks
+	Concurrent                 // neither dominates — concurrent events
+)
+
+// Compare returns the causal relationship of the receiver to other. This is used
+// for anti-entropy diffs (Phase 4) and for labeling concurrent vs causal edits
+// in the timeline UI — NOT for merging state (OR-Set tags and the HLC do that).
+func (vc VectorClock) Compare(other VectorClock) Ordering {
+	var less, greater bool
+	seen := make(map[string]struct{}, len(vc)+len(other))
+	for id := range vc {
+		seen[id] = struct{}{}
+	}
+	for id := range other {
+		seen[id] = struct{}{}
+	}
+	for id := range seen {
+		a, b := vc[id], other[id]
+		if a < b {
+			less = true
+		}
+		if a > b {
+			greater = true
+		}
+	}
+	switch {
+	case less && greater:
+		return Concurrent
+	case less:
+		return Before
+	case greater:
+		return After
+	default:
+		return Equal
+	}
+}
+
 // String renders the clock deterministically, e.g. "a=0,b=0,c=0".
 func (vc VectorClock) String() string {
 	keys := make([]string, 0, len(vc))

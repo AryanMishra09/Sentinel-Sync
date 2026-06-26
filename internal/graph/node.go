@@ -21,3 +21,8 @@ type Node struct {
 	// §17). Using it to break a rename tie would reintroduce the clock-skew bug.
 	CreatedAt int64 `json:"createdAt"`
 }
+
+func (n *Node) clone() *Node {
+	c := *n
+	return &c
+}

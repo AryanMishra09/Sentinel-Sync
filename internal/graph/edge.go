@@ -19,3 +19,8 @@ type Edge struct {
 	Source string `json:"source"`
 	Target string `json:"target"`
 }
+
+func (e *Edge) clone() *Edge {
+	c := *e
+	return &c
+}
