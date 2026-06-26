@@ -35,6 +35,19 @@ asked *"how does a cluster stay available when nodes die?"*, SentinelSync asks
 19. [Phase 2 — Demo Output (Divergence Without Sync)](#19-phase-2--demo-output-divergence-without-sync)
 20. [Phase 2 — Known Limitations & What Phase 3 Adds](#20-phase-2--known-limitations--what-phase-3-adds)
 
+### Phase 3 — CRDT Engine (the core)
+
+21. [The Shift: State Mutates Only By Operations](#21-the-shift-state-mutates-only-by-operations)
+22. [crdt/hlc.go — Hybrid Logical Clock](#22-crdthlcgo--hybrid-logical-clock)
+23. [crdt/vector_clock.go — Increment / Merge / Compare](#23-crdtvector_clockgo--increment--merge--compare)
+24. [crdt/orset.go — Add-Wins Observed-Remove Set](#24-crdtorsetgo--add-wins-observed-remove-set)
+25. [crdt/lww.go — HLC-Ordered LWW Register](#25-crdtlwwgo--hlc-ordered-lww-register)
+26. [graph: State, Apply, Materialize, Convergence Hash](#26-graph-state-apply-materialize-convergence-hash)
+27. [replica: Operation Generation & Ingest](#27-replica-operation-generation--ingest)
+28. [Convergence Tests — The Proof](#28-convergence-tests--the-proof)
+29. [Phase 3 — Demo Output (Dangling Edge Round-Trip)](#29-phase-3--demo-output-dangling-edge-round-trip)
+30. [Phase 3 — Known Limitations & What Phase 4 Adds](#30-phase-3--known-limitations--what-phase-4-adds)
+
 ---
 
 ## 1. Project Overview
@@ -715,5 +728,282 @@ to the log, and build the **convergence checker** (canonical state hash) as the
 test oracle — before any networking. By the end of Phase 3 two replicas fed the
 same operations in any order must produce identical state hashes.
 
-*Last updated: Phase 2 complete (3 independent replicas via Docker Compose,
-peer-aware, divergence demonstrated, race-clean). Next: Phase 3 CRDT engine.*
+---
+
+# Phase 3 — CRDT Engine (the core)
+
+**Goal:** make state *convergent*. Wrap node/edge presence in OR-Sets, title and
+position in HLC-ordered LWW registers, turn every mutation into an `Operation`
+that advances the vector clock + HLC and appends to the log, and build the
+**convergence checker** (a content hash) as the test oracle — all before any
+networking. The bar: two replicas fed the same operations *in any order* produce
+identical state hashes. Met.
+
+---
+
+## 21. The Shift: State Mutates Only By Operations
+
+This is the conceptual heart of the whole project, so it gets its own section.
+
+Through Phase 2, the graph was mutated *directly* — `CreateNode` reached in and
+wrote a map. In Phase 3 that becomes illegal. **The only way state changes is
+`State.Apply(operation)`.** A REST call no longer mutates the graph; it asks the
+replica to *generate an operation*, which is then applied (locally now, and
+broadcast to peers in Phase 4).
+
+Why this matters: if the only mutation path is "apply an operation", and
+operations are designed so that applying them in any order yields the same result
+(OR-Set unions + max-HLC LWW), then a replica that has seen the same set of
+operations as another — regardless of order or duplication — is in the same
+state. That property *is* eventual consistency. Everything else in this phase
+exists to make that one sentence true.
+
+The data flow:
+
+```
+REST call ─▶ Replica.CreateNode() ─▶ build Operation (tag, HLC, vector clock)
+                                       │
+                                       ├─▶ append to operation log
+                                       └─▶ State.Apply(op) ─▶ mutate CRDTs
+Peer op  ─▶ Replica.Ingest(op) ────────┘   (dedup, merge clock, advance HLC)
+```
+
+Local generation and remote ingest converge on the same `State.Apply`. Phase 4
+just adds the transport that carries an op from one replica's log to another's
+`Ingest`.
+
+---
+
+## 22. `crdt/hlc.go` — Hybrid Logical Clock
+
+**File:** `internal/crdt/hlc.go`
+
+The single most important correction from the design review, now in code. LWW
+registers are ordered by an **HLC**, never a raw wall clock.
+
+**The problem it solves:** if rename conflicts were resolved by `time.Now()`, the
+replica with the fastest physical clock would win *every* concurrent rename —
+non-deterministic, skew-dependent, exactly what §11 of the design rejected.
+
+**The algorithm:**
+- `Now()` (local event): `physical = max(physical, wall())`; if the wall clock
+  didn't advance, bump `logical` so timestamps stay strictly increasing.
+- `Update(remote)` (on receive): advance to dominate both local and remote —
+  `physical = max(local, remote, wall())`, with the logical counter reconciled so
+  a cause never out-ranks its effect.
+
+**`HLCTimestamp.After`** defines the total order `(physical, logical, replicaID)`.
+The `replicaID` final tiebreak is what makes the winner *deterministic* — every
+replica independently computes the same one.
+
+**Injected clock:** `NewHLC(id, now)` takes a `func() int64` for wall millis;
+tests pass a counter so HLC winners are predictable. The real binary passes
+`nil` → `time.Now().UnixMilli()`.
+
+---
+
+## 23. `crdt/vector_clock.go` — Increment / Merge / Compare
+
+**File:** `internal/crdt/vector_clock.go`
+
+The clock type existed since Phase 2; Phase 3 adds the behavior:
+- `Increment(id)` — bump own component, once per locally generated op.
+- `Merge(other)` — element-wise max; fold in everything a peer has seen.
+- `Compare(other)` → `Before | After | Equal | Concurrent`.
+
+**Used for sync and concurrency detection — not merge.** Worth repeating because
+it's a classic trap: the merge logic (OR-Set tags, HLC) never consults the vector
+clock. The clock earns its keep in Phase 4's anti-entropy ("which ops is this peer
+missing?") and in labeling concurrent vs causal edits in the timeline. `Compare`
+is built now and tested; it gets *used* in Phase 4.
+
+---
+
+## 24. `crdt/orset.go` — Add-Wins Observed-Remove Set
+
+**File:** `internal/crdt/orset.go`
+
+Node and edge *presence* is an OR-Set. The mechanics:
+- Every add records a unique **tag** `(replicaID, counter)`.
+- A remove records the tags it **observed** at that moment as tombstones.
+- An element is present iff it has an add tag that is not tombstoned.
+
+**Add-wins, concretely:** if replica A deletes node X (observing tag `a-1`) while
+replica B concurrently adds X (tag `b-1`), the delete only tombstones `a-1`.
+After merge, `b-1` is still live → X survives. This is what prevents the
+"zombie resurrection" bug naive sets suffer, and it's the behavior
+`TestORSetAddWins` and `TestConcurrentCreateDeleteAddWins` pin down.
+
+**Why the remove carries observed tags** (rather than just the element id): that
+is precisely the information that lets a concurrent, *unobserved* add escape the
+delete. A remove that blindly erased the element would lose the concurrent add.
+
+**`Merge` is a set union** of adds and of removes — commutative, associative,
+idempotent. That is the formal reason merge order never matters.
+
+**Honest limitation in the comments:** tombstones grow forever (no
+causal-stability GC in V1). Surfaced as the `tombstones` field in `/status` and
+`TombstoneCount()`.
+
+---
+
+## 25. `crdt/lww.go` — HLC-Ordered LWW Register
+
+**File:** `internal/crdt/lww.go`
+
+A generic `LWWRegister[T]` holding a value and its HLC timestamp. `Set(v, ts)`
+applies the write only if `ts.After(current)`. Used for `Title` (string) and
+`Position` (an `{X,Y}` struct).
+
+Because `Set` keeps the max-HLC write, applying the same writes in any order
+lands on the same value — the register-level convergence that the whole graph's
+convergence is built from. `TestRenameLWWHigherHLCWins` checks both apply orders
+reach the same winner.
+
+This is the **scoped** LWW the blueprint endorses (one field that genuinely can't
+keep two values), not the document-level LWW that loses data and was rejected.
+
+---
+
+## 26. graph: State, Apply, Materialize, Convergence Hash
+
+**Files:** `internal/graph/graph.go`, `materialize.go`, `convergence.go`
+(and `node.go` / `edge.go` for the materialized types)
+
+The plain Phase 1 engine is replaced by a CRDT `State`:
+
+```go
+type State struct {
+    nodes, edges *crdt.ORSet                          // presence
+    titles    map[string]*crdt.LWWRegister[string]    // per-node title
+    positions map[string]*crdt.LWWRegister[Position]  // per-node position
+    endpoints map[string]endpoint                     // edge -> src/target
+    createdAt map[string]int64                        // display metadata
+}
+```
+
+**`Apply(op)` is the whole state machine** — a switch over op type that updates
+the right CRDT. It is deterministic and order-independent by construction. The
+operation payloads (`CreateNodePayload`, …) live in the `graph` package because
+`Apply` interprets them; `crdt.Operation` only carries the raw bytes, so `crdt`
+never imports `graph` (no cycle).
+
+**`materialize.go` — the read boundary.** `Snapshot()` resolves the CRDTs into
+plain `Node`/`Edge` lists, sorted by ID, and is where **edge referential
+integrity** is enforced: an edge is emitted only if both endpoints are present
+nodes. The edge OR-Set is never mutated for this — a node deleted out from under
+an edge simply makes the edge vanish from the view, and *reappear* if the node
+returns. This is the §13a policy, and the live demo (§29) shows the round-trip.
+
+**`convergence.go` — the oracle.** `Hash()` is a SHA-256 over the canonical
+snapshot, with length-prefixed fields so `"ab"+"c"` can't collide with `"a"+"bc"`.
+`CreatedAt` is deliberately excluded — it's display metadata, not logical state.
+This hash is the test oracle *and* the `stateHash` in `/status` (so an external
+script can compare replicas), and it will drive the divergence metric in Phase 5.
+
+**Local-convenience errors:** `CreateNode` on an existing id still returns a
+`409` for nice API behavior, but these checks are *local only* — `Apply`/`Ingest`
+never reject a peer's operation. A replica must accept anything a peer sends.
+
+---
+
+## 27. replica: Operation Generation & Ingest
+
+**File:** `internal/replica/replica.go`
+
+The `Replica` becomes the operation engine.
+
+**`emit(type, build)`** is the local-generation core: lock, `clock.Increment`,
+`hlc.Now()`, mint the unique tag `(id, counter)`, marshal the payload, assemble
+the `Operation` (carrying a vector-clock snapshot + HLC), record it as applied,
+append to the log, and `state.Apply` it. Every public mutation (`CreateNode`,
+`RenameNode`, …) is a thin wrapper that supplies its payload.
+
+**Delete carries observed tags:** `DeleteNode` reads `state.ObservedNodeTags(id)`
+and ships them in the op, so the add-wins semantics survive replication.
+
+**`Ingest(op)`** is the remote path: dedup by op ID (idempotent —
+`TestIngestIdempotent`), `clock.Merge`, `hlc.Update`, append, `state.Apply`. This
+is the exact entry point Phase 4's transport will call.
+
+**Two locks, still:** the graph `State` has its own lock; the replica's lock
+guards the clock/log/applied set. Generation serializes through the replica lock
+so the log and clock stay consistent.
+
+**No cascade delete.** Deleting a node no longer touches edges (Phase 1 did). The
+dangling edge is handled at materialization — the correct CRDT behavior, and the
+visible difference from Phase 1.
+
+---
+
+## 28. Convergence Tests — The Proof
+
+**Files:** `internal/graph/graph_test.go`, `internal/replica/replica_test.go`
+
+| Test | What it proves |
+|---|---|
+| `TestConvergenceOrderIndependent` | Same ops, forward vs reverse order → identical hash |
+| `TestRenameLWWHigherHLCWins` | LWW winner is the same regardless of apply order |
+| `TestORSetAddWins` | Concurrent add survives a delete that didn't observe it |
+| `TestDanglingEdgeFilteredAndRestored` | Edge hidden when endpoint deleted, restored when re-added |
+| `TestTwoReplicasConverge` | Two replicas, independent edits, exchange logs → equal hash |
+| `TestConcurrentRenameConverges` | Concurrent renames of one node converge to one winner |
+| `TestConcurrentCreateDeleteAddWins` | Add-wins holds end-to-end across replicas |
+| `TestIngestIdempotent` | Duplicate delivery changes nothing |
+
+`syncAll` in the replica test cross-feeds every replica's op log into the others
+— a lossless stand-in for Phase 4's network. The whole suite runs under `-race`.
+
+---
+
+## 29. Phase 3 — Demo Output (Dangling Edge Round-Trip)
+
+Single replica, compiled binary (use the binary, not `go run` — a killed
+`go run` orphans its child, the lesson SentinelCache's DEVLOG already recorded;
+we hit it again here):
+
+```
+== create 2 nodes + edge ==
+graph: nodes[1:Email, 2:AI]  edges[e1: 1->2]
+
+== dangling edge to nonexistent node 99 (ALLOWED now, was 422 in Phase 1) ==
+POST /edge {e2: 1->99} → echoed {id:e2,...}
+visible edges: [e1]                ← e2 created in the OR-Set but filtered
+
+== delete node 2 → e1 dangles & disappears (NO cascade) ==
+nodes: [1]  edges: []              ← e1 hidden, but still in the edge OR-Set
+
+== re-add node 2 → e1 REAPPEARS ==
+nodes: [1, 2]  edges: [e1]         ← edge OR-Set untouched, so it comes back
+
+== status ==
+{ nodes:2, edges:1, opLogLen:6, tombstones:1,
+  vectorClock:{replica-a:6},
+  stateHash:"ba68493d…" }
+```
+
+The reappearing edge is the whole §13a story in one curl session — and it is the
+behavior Phase 1's cascade delete made *impossible*. `stateHash` is the
+convergence oracle, now observable over HTTP.
+
+---
+
+## 30. Phase 3 — Known Limitations & What Phase 4 Adds
+
+| Limitation (by design) | Removed in |
+|---|---|
+| Replicas converge only when ops are hand-fed (tests/`syncAll`) | Phase 4 (real transport) |
+| `Compare` / vector-clock diff built but unused | Phase 4 (anti-entropy) |
+| No retransmission, no loss handling | Phase 4 (op log + anti-entropy) |
+| Tombstones & op log grow unbounded | V2 (causal-stability GC) |
+| State in-memory | V2 (persistent log) |
+
+**Next: Phase 4 — Replication Layer.** Give each replica a WebSocket transport
+that broadcasts every generated operation to peers (who apply it via `Ingest`),
+plus the anti-entropy loop that uses the vector-clock diff to recover operations
+lost to latency or partition. After Phase 4 the convergence proven here happens
+live, over the network — and `syncAll` gets replaced by real wires.
+
+*Last updated: Phase 3 complete (CRDT engine — OR-Set, HLC-LWW, vector clocks,
+convergence checker; convergence proven by tests + live dangling-edge demo;
+race-clean). Next: Phase 4 replication + anti-entropy.*

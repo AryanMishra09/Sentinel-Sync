@@ -22,13 +22,13 @@ func main() {
 	restAddr := env("REST_ADDR", ":8080")
 	peers := parsePeers(env("PEERS", ""))
 
-	r := replica.New(replicaID, peers)
+	r := replica.New(replicaID, peers, nil) // nil → real wall clock for the HLC
 	h := api.NewHandler(r)
 
 	engine := gin.Default()
 	h.RegisterRoutes(engine)
 
-	log.Printf("[%s] SentinelSync replica on %s — %d peer(s) known, no sync yet (Phase 2)",
+	log.Printf("[%s] SentinelSync replica on %s — %d peer(s) known, CRDT engine active, no transport yet (Phase 3)",
 		replicaID, restAddr, len(peers))
 	if err := engine.Run(restAddr); err != nil {
 		log.Fatalf("[%s] server error: %v", replicaID, err)
