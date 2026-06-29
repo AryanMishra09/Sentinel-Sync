@@ -25,4 +25,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/sim/loss", h.handleSetLoss)
 	r.POST("/sim/isolate", h.handleIsolate)
 	r.POST("/sim/recover", h.handleRecover)
+
+	// Phase 6 — simulated users
+	r.POST("/sim/users/start", h.handleSimStart)
+	r.POST("/sim/users/stop", h.handleSimStop)
+	r.GET("/sim/users/stats", h.handleSimStats)
 }

@@ -17,13 +17,14 @@ import (
 
 // Handler wires HTTP requests to one replica.
 type Handler struct {
-	replica *replica.Replica
-	chaos   *simulation.Chaos
+	replica   *replica.Replica
+	chaos     *simulation.Chaos
+	simulator *simulation.Simulator
 }
 
-// NewHandler builds a handler bound to a replica and its chaos injector.
-func NewHandler(r *replica.Replica, chaos *simulation.Chaos) *Handler {
-	return &Handler{replica: r, chaos: chaos}
+// NewHandler builds a handler bound to a replica, its chaos injector, and its simulator.
+func NewHandler(r *replica.Replica, chaos *simulation.Chaos, sim *simulation.Simulator) *Handler {
+	return &Handler{replica: r, chaos: chaos, simulator: sim}
 }
 
 // --- request bodies --------------------------------------------------------
@@ -144,6 +145,7 @@ func (h *Handler) handleStatus(c *gin.Context) {
 		"tombstones":  h.replica.TombstoneCount(),
 		"stateHash":   h.replica.Hash(),
 		"chaos":       h.chaos.Snapshot(),
+		"sim":         h.simulator.Stats(),
 	})
 }
 

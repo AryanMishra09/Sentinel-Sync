@@ -41,7 +41,15 @@ plumbing. See [`docs/`](docs) for the blueprint, system design, and phased plan.
   anti-entropy tick (≤3 s). `/status` exposes current chaos settings.
   Partition+recovery demonstrated on live 3-replica Docker cluster.
 
-Roadmap: **Phase 6** simulated users → 7 dashboard → 8 replay / time travel.
+- **Phase 6 — Simulated Users (done).** Virtual users inside the backend fire random
+  graph mutations (create/rename/move/delete) at a configurable rate via
+  `POST /sim/users/start {"users":10,"opsPerSec":5.0}`. Each user goroutine tracks
+  its own node namespace to avoid ID conflicts; deletes and concurrent mutations are
+  handled gracefully. `Stop()` uses a `sync.WaitGroup` to drain goroutines before
+  returning — ensuring no ops leak after the call. Live demo: 10 users, 5 ops/sec,
+  150 ops in 3 s, all three replicas converged to the same `stateHash`.
+
+Roadmap: **Phase 7** dashboard → 8 replay / time travel.
 
 ## Quick start
 
@@ -72,5 +80,8 @@ make docker-down # stop it
 | `POST` | `/sim/loss` | Set packet loss probability `{"rate":0.3}` (Phase 5) |
 | `POST` | `/sim/isolate` | Soft-partition this replica (Phase 5) |
 | `POST` | `/sim/recover` | Lift soft-partition (Phase 5) |
+| `POST` | `/sim/users/start` | Start virtual users `{"users":10,"opsPerSec":5.0}` (Phase 6) |
+| `POST` | `/sim/users/stop` | Stop virtual users (Phase 6) |
+| `GET` | `/sim/users/stats` | Sim stats: running, totalOps (Phase 6) |
 
 Build narrative and per-file rationale live in [`DEVLOG.md`](DEVLOG.md).

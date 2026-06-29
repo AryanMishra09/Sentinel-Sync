@@ -27,7 +27,8 @@ func main() {
 
 	chaos := simulation.NewChaos()
 	r := replica.New(replicaID, peers, nil) // nil → real wall clock for the HLC
-	h := api.NewHandler(r, chaos)
+	sim := simulation.NewSimulator(r)
+	h := api.NewHandler(r, chaos, sim)
 
 	// Replica-to-replica WebSocket transport: broadcast + anti-entropy.
 	mgr := transport.NewManager(r, chaos)
@@ -37,7 +38,7 @@ func main() {
 	h.RegisterRoutes(engine)
 	engine.GET("/ws", gin.WrapF(mgr.HandleWS)) // peer connections land here
 
-	log.Printf("[%s] SentinelSync replica on %s — %d peer(s), CRDT + WebSocket replication + network simulation active (Phase 5)",
+	log.Printf("[%s] SentinelSync replica on %s — %d peer(s), CRDT + WebSocket replication + network simulation + virtual users active (Phase 6)",
 		replicaID, restAddr, len(peers))
 	if err := engine.Run(restAddr); err != nil {
 		log.Fatalf("[%s] server error: %v", replicaID, err)
