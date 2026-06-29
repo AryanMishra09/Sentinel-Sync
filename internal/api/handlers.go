@@ -11,17 +11,19 @@ import (
 
 	"github.com/aryan-mishra/sentinel-sync/internal/graph"
 	"github.com/aryan-mishra/sentinel-sync/internal/replica"
+	"github.com/aryan-mishra/sentinel-sync/internal/simulation"
 	"github.com/gin-gonic/gin"
 )
 
 // Handler wires HTTP requests to one replica.
 type Handler struct {
 	replica *replica.Replica
+	chaos   *simulation.Chaos
 }
 
-// NewHandler builds a handler bound to a replica.
-func NewHandler(r *replica.Replica) *Handler {
-	return &Handler{replica: r}
+// NewHandler builds a handler bound to a replica and its chaos injector.
+func NewHandler(r *replica.Replica, chaos *simulation.Chaos) *Handler {
+	return &Handler{replica: r, chaos: chaos}
 }
 
 // --- request bodies --------------------------------------------------------
@@ -141,6 +143,7 @@ func (h *Handler) handleStatus(c *gin.Context) {
 		"opLogLen":    h.replica.OpLogLen(),
 		"tombstones":  h.replica.TombstoneCount(),
 		"stateHash":   h.replica.Hash(),
+		"chaos":       h.chaos.Snapshot(),
 	})
 }
 

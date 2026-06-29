@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aryan-mishra/sentinel-sync/internal/replica"
+	"github.com/aryan-mishra/sentinel-sync/internal/simulation"
 )
 
 // node wires a replica + manager behind an httptest server exposing /ws.
@@ -19,9 +20,13 @@ type node struct {
 }
 
 func startNode(id string, base int64) *node {
+	return startNodeWithChaos(id, base, simulation.NewChaos())
+}
+
+func startNodeWithChaos(id string, base int64, chaos *simulation.Chaos) *node {
 	clock := int64(base)
 	rep := replica.New(id, nil, func() int64 { clock++; return clock })
-	mgr := NewManager(rep)
+	mgr := NewManager(rep, chaos)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", mgr.HandleWS)
@@ -113,3 +118,74 @@ func TestAntiEntropyCatchUp(t *testing.T) {
 }
 
 func nodes(n *node) int { c, _ := n.rep.Counts(); return c }
+
+// Soft-isolate B while A writes; lift isolation; anti-entropy must catch B up.
+func TestChaosIsolationConverges(t *testing.T) {
+	chaosB := simulation.NewChaos()
+	a := startNode("a", 1000)
+	b := startNodeWithChaos("b", 2000, chaosB)
+	defer a.stop()
+	defer b.stop()
+
+	a.connect(b)
+	b.connect(a)
+
+	if !eventually(t, 2*time.Second, func() bool { return len(a.mgr.conns()) > 0 }) {
+		t.Fatal("mesh did not come up")
+	}
+
+	// Partition B — both directions blocked.
+	chaosB.SetIsolated(true)
+
+	a.rep.CreateNode("1", "isolated-write", 0, 0)
+	a.rep.CreateNode("2", "another-write", 0, 0)
+
+	// Give broadcast a moment; B must NOT have it.
+	time.Sleep(100 * time.Millisecond)
+	if nodes(b) != 0 {
+		t.Fatalf("isolated B should have 0 nodes, got %d", nodes(b))
+	}
+
+	// Lift isolation — next anti-entropy tick (≤3s) catches B up.
+	chaosB.SetIsolated(false)
+
+	if !eventually(t, 5*time.Second, func() bool { return a.rep.Hash() == b.rep.Hash() }) {
+		t.Fatalf("did not converge after lifting isolation:\n a=%s (%d)\n b=%s (%d)",
+			a.rep.Hash(), nodes(a), b.rep.Hash(), nodes(b))
+	}
+}
+
+// 100% outgoing packet loss on A: broadcast from A to B is dropped. After
+// clearing loss, A's next anti-entropy sync_request delivers the missing ops.
+func TestChaosPacketLossConverges(t *testing.T) {
+	chaosA := simulation.NewChaos()
+	a := startNodeWithChaos("a", 1000, chaosA)
+	b := startNode("b", 2000)
+	defer a.stop()
+	defer b.stop()
+
+	a.connect(b)
+	b.connect(a)
+
+	if !eventually(t, 2*time.Second, func() bool { return len(a.mgr.conns()) > 0 && len(b.mgr.conns()) > 0 }) {
+		t.Fatal("mesh did not come up")
+	}
+
+	// Total loss on A's outbound — no broadcast or sync_request can leave A.
+	chaosA.SetLossRate(1.0)
+	a.rep.CreateNode("1", "lost-write", 0, 0)
+	a.rep.CreateNode("2", "also-lost", 0, 0)
+
+	time.Sleep(100 * time.Millisecond)
+	if nodes(b) != 0 {
+		t.Fatalf("B should have 0 nodes during 100%% loss, got %d", nodes(b))
+	}
+
+	// Clear loss — A's next anti-entropy tick sends its clock, B responds normally.
+	chaosA.SetLossRate(0.0)
+
+	if !eventually(t, 6*time.Second, func() bool { return a.rep.Hash() == b.rep.Hash() }) {
+		t.Fatalf("did not converge after clearing packet loss:\n a=%s (%d)\n b=%s (%d)",
+			a.rep.Hash(), nodes(a), b.rep.Hash(), nodes(b))
+	}
+}

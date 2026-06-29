@@ -19,4 +19,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 	r.POST("/edge", h.handleCreateEdge)
 	r.DELETE("/edge/:id", h.handleDeleteEdge)
+
+	// Phase 5 — network fault injection
+	r.POST("/sim/latency", h.handleSetLatency)
+	r.POST("/sim/loss", h.handleSetLoss)
+	r.POST("/sim/isolate", h.handleIsolate)
+	r.POST("/sim/recover", h.handleRecover)
 }

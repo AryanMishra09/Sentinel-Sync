@@ -34,8 +34,14 @@ plumbing. See [`docs/`](docs) for the blueprint, system design, and phased plan.
   silently skipped. The 3-replica Docker cluster converges to an identical
   `stateHash` within milliseconds of a write. All tests pass with `-race`.
 
-Roadmap: **Phase 5** network simulation (drop/delay/partition) → 6 simulated users
-→ 7 dashboard → 8 replay / time travel.
+- **Phase 5 — Network Simulation (done).** Runtime fault injection via REST:
+  `POST /sim/latency` (delay), `POST /sim/loss` (packet loss rate), `POST /sim/isolate`
+  (soft partition — both directions blocked), `POST /sim/recover` (lift partition).
+  Isolation keeps TCP connections alive so recovery is instantaneous on the next
+  anti-entropy tick (≤3 s). `/status` exposes current chaos settings.
+  Partition+recovery demonstrated on live 3-replica Docker cluster.
+
+Roadmap: **Phase 6** simulated users → 7 dashboard → 8 replay / time travel.
 
 ## Quick start
 
@@ -62,5 +68,9 @@ make docker-down # stop it
 | `POST` | `/edge` | Create edge `{id,source,target}` (dangling allowed) |
 | `DELETE` | `/edge/:id` | Delete edge |
 | `GET` (WS) | `/ws` | Peer-to-peer replication endpoint (Phase 4) |
+| `POST` | `/sim/latency` | Set outgoing message delay `{"ms":200}` (Phase 5) |
+| `POST` | `/sim/loss` | Set packet loss probability `{"rate":0.3}` (Phase 5) |
+| `POST` | `/sim/isolate` | Soft-partition this replica (Phase 5) |
+| `POST` | `/sim/recover` | Lift soft-partition (Phase 5) |
 
 Build narrative and per-file rationale live in [`DEVLOG.md`](DEVLOG.md).
