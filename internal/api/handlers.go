@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/aryan-mishra/sentinel-sync/internal/crdt"
 	"github.com/aryan-mishra/sentinel-sync/internal/graph"
 	"github.com/aryan-mishra/sentinel-sync/internal/replica"
 	"github.com/aryan-mishra/sentinel-sync/internal/simulation"
@@ -131,6 +132,22 @@ func (h *Handler) handleDeleteEdge(c *gin.Context) {
 
 func (h *Handler) handleGetGraph(c *gin.Context) {
 	c.JSON(http.StatusOK, h.replica.Snapshot())
+}
+
+// handleGetOps returns the last 50 operations (most recent first) for the
+// dashboard's operation timeline.
+func (h *Handler) handleGetOps(c *gin.Context) {
+	all := h.replica.OpLog()
+	const limit = 50
+	if len(all) > limit {
+		all = all[len(all)-limit:]
+	}
+	// Reverse: newest first so the timeline reads top-to-bottom.
+	out := make([]crdt.Operation, len(all))
+	for i, op := range all {
+		out[len(all)-1-i] = op
+	}
+	c.JSON(http.StatusOK, out)
 }
 
 func (h *Handler) handleStatus(c *gin.Context) {

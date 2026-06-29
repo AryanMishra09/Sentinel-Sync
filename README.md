@@ -49,7 +49,22 @@ plumbing. See [`docs/`](docs) for the blueprint, system design, and phased plan.
   returning — ensuring no ops leak after the call. Live demo: 10 users, 5 ops/sec,
   150 ops in 3 s, all three replicas converged to the same `stateHash`.
 
-Roadmap: **Phase 7** dashboard → 8 replay / time travel.
+- **Phase 7 — Dashboard (done).** React 18 + Vite 5 + React Flow 12 frontend
+  served by nginx in Docker (`localhost:3000`). Live convergence banner (✓/⚠),
+  per-replica status panels with inline chaos/sim controls, React Flow graph
+  visualization, and an operation timeline. Polls `/status`, `/graph`, and `/ops`
+  every 1.5 s with `AbortSignal.timeout(1000)` so a crashed replica never stalls
+  the UI. Full partition+recovery demo visible from a single browser tab.
+
+- **Phase 8 — Replay and Time Travel (done).** `GET /replay?upto=<index>` replays
+  the op log through a throwaway replica and returns the graph at that moment.
+  Frontend adds a convergence chart (SVG line chart of per-replica node counts,
+  red bands for divergence windows) and a scrubber (range slider, debounced
+  150 ms, "Go Live" button). History accumulates in App.tsx — up to 60 samples,
+  enough to show a full partition+recovery cycle at 1.5 s polling. 4 new replay
+  tests, all race-clean.
+
+Project is **feature-complete** for the 8-phase plan.
 
 ## Quick start
 
@@ -58,8 +73,12 @@ make run         # start one replica on :8080
 make test        # run tests with the race detector
 make build       # compile to bin/replica
 
-make docker-up   # start the 3-replica cluster (a:8080, b:8081, c:8082)
-make docker-down # stop it
+make docker-up   # start replicas (a:8080, b:8081, c:8082) + dashboard (:3000)
+make docker-down # stop all containers
+
+make frontend-install  # npm install (run once after clone)
+make frontend-dev      # Vite dev server on :3000 (hot-reload)
+make frontend-build    # production build → frontend/dist/
 ```
 
 ### REST + WebSocket API
@@ -83,5 +102,7 @@ make docker-down # stop it
 | `POST` | `/sim/users/start` | Start virtual users `{"users":10,"opsPerSec":5.0}` (Phase 6) |
 | `POST` | `/sim/users/stop` | Stop virtual users (Phase 6) |
 | `GET` | `/sim/users/stats` | Sim stats: running, totalOps (Phase 6) |
+| `GET` | `/ops` | Last 50 operations, newest first (Phase 7) |
+| `GET` | `/replay` | Graph snapshot at op index `?upto=<N>` (Phase 8) |
 
 Build narrative and per-file rationale live in [`DEVLOG.md`](DEVLOG.md).

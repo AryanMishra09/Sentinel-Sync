@@ -1,4 +1,4 @@
-.PHONY: build run test tidy clean docker-up docker-down docker-logs
+.PHONY: build run test tidy clean docker-up docker-down docker-logs frontend-install frontend-dev frontend-build
 
 # Compile the replica binary to bin/replica.
 build:
@@ -30,4 +30,18 @@ docker-logs:
 
 # Remove build artifacts.
 clean:
-	rm -rf bin/
+	rm -rf bin/ frontend/dist frontend/node_modules
+
+# ── Frontend (Phase 7) ────────────────────────────────────────────────────
+
+# Install frontend npm dependencies (run once after cloning).
+frontend-install:
+	cd frontend && npm install
+
+# Start the Vite dev server on :3000 (hot-reload; replicas must be running).
+frontend-dev:
+	cd frontend && npm run dev
+
+# Build the production bundle to frontend/dist/.
+frontend-build:
+	cd frontend && npm run build

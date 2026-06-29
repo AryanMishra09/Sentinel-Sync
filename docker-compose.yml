@@ -37,3 +37,14 @@ services:
       REPLICA_ID: replica-c
       REST_ADDR: ":8080"
       PEERS: "replica-a=http://replica-a:8080,replica-b=http://replica-b:8080"
+
+  # Phase 7 — dashboard (React + Vite, served by nginx on :3000)
+  dashboard:
+    build: ./frontend
+    container_name: sentinel-dashboard
+    ports:
+      - "3000:3000"
+    depends_on:
+      - replica-a
+      - replica-b
+      - replica-c

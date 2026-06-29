@@ -79,6 +79,32 @@ asked *"how does a cluster stay available when nodes die?"*, SentinelSync asks
 51. [Phase 6 — Demo Output (100 Users Under Load)](#51-phase-6--demo-output-100-users-under-load)
 52. [Phase 6 — Known Limitations & What Phase 7 Adds](#52-phase-6--known-limitations--what-phase-7-adds)
 
+### Phase 7 — Dashboard
+
+53. [Why a Dashboard and What It Shows](#53-why-a-dashboard-and-what-it-shows)
+54. [Backend: CORS + GET /ops](#54-backend-cors--get-ops)
+55. [frontend/ Project Structure](#55-frontend-project-structure)
+56. [types.ts + hooks/useReplica.ts — Data Layer](#56-typests--hooksusereplicats--data-layer)
+57. [components/ReplicaPanel.tsx — Controls + Status](#57-componentsreplicapaneltsx--controls--status)
+58. [components/GraphView.tsx — React Flow Visualization](#58-componentsgraphviewtsx--react-flow-visualization)
+59. [components/Timeline.tsx — Operation Stream](#59-componentstimelinetsx--operation-stream)
+60. [App.tsx + App.css — Layout and Convergence Banner](#60-apptsx--appcss--layout-and-convergence-banner)
+61. [Docker + Makefile](#61-docker--makefile)
+62. [Phase 7 — Demo Output](#62-phase-7--demo-output)
+63. [Phase 7 — Known Limitations & What Phase 8 Adds](#63-phase-7--known-limitations--what-phase-8-adds)
+
+### Phase 8 — Replay and Time Travel
+
+64. [Why Replay and What It Proves](#64-why-replay-and-what-it-proves)
+65. [Backend: GET /replay](#65-backend-get-replay)
+66. [internal/api/replay_test.go — Four Tests](#66-internalapireplay_testgo--four-tests)
+67. [hooks/useReplica.ts — useReplay (Debounced)](#67-hooksusereplicats--usereplay-debounced)
+68. [components/ConvergenceChart.tsx — SVG Line Chart](#68-componentsconvergencecharttsx--svg-line-chart)
+69. [components/ReplayBar.tsx — Scrubber + Live Button](#69-componentsreplaybartsx--scrubber--live-button)
+70. [App.tsx — History Buffer + Replay Mode Wiring](#70-apptsx--history-buffer--replay-mode-wiring)
+71. [Phase 8 — Demo Output](#71-phase-8--demo-output)
+72. [Phase 8 — Known Limitations](#72-phase-8--known-limitations)
+
 ---
 
 ## 1. Project Overview
@@ -1832,3 +1858,568 @@ After Phase 7, the entire demo runs from a browser.
 *Last updated: Phase 6 complete (simulated users — virtual user engine with
 WaitGroup drain, REST start/stop/stats, 5 new tests race-clean, live Docker demo
 150 ops/3s all converging).*
+
+---
+
+# Phase 7 — Dashboard
+
+**Goal:** make the demo visual. A React + TypeScript + Vite frontend that renders
+the live graph, shows each replica's status and chaos settings, surfaces the
+convergence verdict in a banner, and puts every simulation control one click away.
+After this phase the entire SentinelSync demo runs from a browser.
+
+---
+
+## 53. Why a Dashboard and What It Shows
+
+The REST API is sufficient to prove correctness — equal `stateHash` values across
+replicas is a complete proof. But it is not sufficient for an interview demo. A
+recruiter watching curl output cannot immediately see divergence, reconnection,
+or convergence. A browser can.
+
+The dashboard is organized around five concerns:
+
+| Section | What it surfaces |
+|---|---|
+| Convergence banner | Are all online replicas identical? Updated every 1.5 s. |
+| Replica panels | Per-replica: node/edge/op counts, hash, vector clock, chaos badges, sim status, all controls |
+| Graph (React Flow) | Live rendered graph from any selected replica |
+| Operation timeline | Last 50 ops from selected replica — type, origin, id, timestamp |
+
+The frontend is intentionally *observing* the distributed system, not part of
+it — it calls the same REST API a human would use. The replicas don't know the
+dashboard exists.
+
+---
+
+## 54. Backend: CORS + GET /ops
+
+**`cmd/replica/main.go`** — inline CORS middleware added before route registration:
+
+```go
+engine.Use(func(c *gin.Context) {
+    c.Header("Access-Control-Allow-Origin", "*")
+    c.Header("Access-Control-Allow-Methods", "GET, POST, DELETE, PATCH, OPTIONS")
+    c.Header("Access-Control-Allow-Headers", "Content-Type")
+    if c.Request.Method == "OPTIONS" {
+        c.AbortWithStatus(204)
+        return
+    }
+    c.Next()
+})
+```
+
+Without this, the browser blocks every API call from the Vite dev server
+(`localhost:3000` → `localhost:8080`) as a CORS violation.
+
+**`GET /ops`** (new endpoint, `handlers.go` + `routes.go`):
+
+Returns the last 50 operations from the op log, reversed (newest first) for the
+timeline. The full `crdt.Operation` struct is serialized — `id`, `replicaId`,
+`type`, `hlc`, `vectorClock`, `payload`. The timeline uses `type`, `replicaId`,
+`id`, and `hlc.physical` (for clock display).
+
+Why 50? Enough for the timeline to feel live (operations tick in every fraction
+of a second under sim load) without sending kilobytes on every poll.
+
+---
+
+## 55. `frontend/` Project Structure
+
+```
+frontend/
+  package.json          React 18, @xyflow/react ^12, Vite 5, TypeScript 5
+  tsconfig.json         ESNext, bundler moduleResolution, strict
+  vite.config.ts        dev proxy (/api-a → :8080, /api-b → :8081, /api-c → :8082)
+  index.html
+  nginx.conf            listens :3000, SPA fallback
+  Dockerfile            node:20-alpine builder → nginx:1.27-alpine runner
+  src/
+    main.tsx            StrictMode root
+    App.tsx             main layout + polling orchestration
+    App.css             dark theme (CSS variables, no external UI library)
+    types.ts            ReplicaStatus, GraphSnapshot, Operation, REPLICAS, REPLICA_COLORS
+    hooks/
+      useReplica.ts     useReplicas, useGraph, useOps (setInterval polling), apiPost helper
+    components/
+      ReplicaPanel.tsx  per-replica status card + all sim/chaos controls
+      GraphView.tsx     React Flow wrapper (useNodesState/useEdgesState, fitView)
+      Timeline.tsx      op list with color-coded type badges
+```
+
+No Zustand, no UI library, no CSS framework. All state lives in `App.tsx` via
+`useState` + `useEffect` polling. This keeps the bundle small and the data flow
+obvious — important for a portfolio project where the *backend* is the star.
+
+---
+
+## 56. `types.ts` + `hooks/useReplica.ts` — Data Layer
+
+**`types.ts`** defines the TypeScript mirrors of the Go API responses:
+
+```typescript
+interface ReplicaStatus {
+  replicaId: string; nodes: number; edges: number; opLogLen: number;
+  stateHash: string; vectorClock: Record<string,number>;
+  tombstones: number; peers: ...; chaos: {...}; sim: {...};
+  error?: string;  // set by the frontend if fetch failed
+}
+```
+
+`error` is added by the hook, not the server — so the rest of the app can do
+`if (status.error)` and show "Offline" without special-casing fetch failures.
+
+**`hooks/useReplica.ts`** has three polling hooks:
+
+| Hook | Endpoint | Interval | Notes |
+|---|---|---|---|
+| `useReplicas` | `/status` × 3 | 1.5 s | Promise.all for all three in parallel; catches per-replica |
+| `useGraph` | `/graph` | 1.5 s | Returns stale graph on error (keeps display stable) |
+| `useOps` | `/ops` | 1.5 s | Returns stale list on error |
+
+`AbortSignal.timeout(1000)` on every fetch ensures a crashed replica doesn't
+stall the polling loop — after 1 s the fetch aborts and the error is surfaced.
+
+---
+
+## 57. `components/ReplicaPanel.tsx` — Controls + Status
+
+Each panel shows, per replica:
+
+- **Status dot** — green pulse (online) or grey (offline/error)
+- **4-stat grid** — nodes, edges, ops, hash (first 8 hex chars)
+- **Vector clock chips** — `a:3 b:0 c:1` in monospace
+- **Fault badges** — `ISOLATED` (red), `LOSS 30%` (yellow), `200ms LAG` (yellow),
+  `SIM 10u · 150 ops` (blue) — show only when active
+- **Controls** — Isolate/Recover, Set Latency, Set Loss, Start/Stop Sim
+
+All control buttons call `apiPost` from the hooks module. `busy` state disables
+buttons while a request is in-flight to prevent double-submission.
+
+The `isSelected` prop controls which replica's graph and timeline are displayed —
+clicking the panel header selects it, highlighted with the replica's accent color
+(blue for A, green for B, orange for C).
+
+---
+
+## 58. `components/GraphView.tsx` — React Flow Visualization
+
+```typescript
+const [nodes, setNodes, onNodesChange] = useNodesState<AppNode>([])
+const [edges, setEdges, onEdgesChange] = useEdgesState<AppEdge>([])
+
+useEffect(() => {
+  setNodes(graph.nodes.map(n => ({
+    id: n.id, position: { x: n.x, y: n.y },
+    data: { label: n.title || n.id },
+    style: { background: '#1e2235', border: `1px solid ${color}55`, ... }
+  })))
+  setEdges(graph.edges.map(e => ({ id: e.id, source: e.source, target: e.target, ... })))
+}, [graph, color])
+```
+
+`useNodesState` / `useEdgesState` are the canonical React Flow hooks — they
+manage the node/edge arrays and fire `onNodesChange` / `onEdgesChange` for
+internal layout updates (dragging, zooming). The `useEffect` re-syncs them when
+the polled graph snapshot changes.
+
+`fitView` re-fits the viewport each time the component mounts (new replica
+selected). Nodes use the backend's `x,y` positions as returned by the graph
+(simulator sets random positions in [0,800]×[0,600]).
+
+`colorMode="dark"` switches React Flow's controls and background to a dark theme.
+Node and edge colors are tinted with the replica's accent color.
+
+**Type parameter note:** React Flow v12 requires explicit generic parameters on
+`useNodesState<AppNode>` and `useEdgesState<AppEdge>` — omitting them causes a
+`never[]` type error on `setNodes`. TypeScript catches this at build time.
+
+---
+
+## 59. `components/Timeline.tsx` — Operation Stream
+
+Renders the last 40 operations from `/ops` (newest first). Each row:
+
+```
+12:04:31   create node   a   a-n42
+12:04:31   rename node   a   a-n41
+12:04:30   delete node   b   b-n3
+```
+
+- **Time** — `hlc.physical` formatted as `HH:MM:SS` (wall clock from the HLC,
+  accurate enough for a timeline)
+- **Type** — color-coded: green for create, blue for rename/move, red for delete
+- **Replica** — stripped of `replica-` prefix for brevity
+- **ID** — the operation ID (truncated via CSS overflow)
+
+The timeline makes the simulation *feel alive* — under load it ticks continuously,
+and when you isolate a replica you can see its ops stop appearing. When you
+recover it, its ops flood back in.
+
+---
+
+## 60. `App.tsx` + `App.css` — Layout and Convergence Banner
+
+**Layout:**
+
+```
+Header:  ⬡ SentinelSync  [✓ Converged / ⚠ Diverged]  [N/3 online]
+Row:     [Replica A]  [Replica B]  [Replica C]
+Grid:    [Graph (React Flow)]  [Operation Timeline]
+```
+
+`useReplicas` runs at the top of `App`. The convergence verdict:
+
+```typescript
+const online = statuses.filter(s => s && !s.error && s.stateHash)
+const allConverged = online.length > 1 &&
+  online.every(s => s.stateHash === online[0].stateHash)
+```
+
+The banner flips from green (`✓ Converged`) to red (`⚠ Diverged`) the moment
+any online replica diverges — no refresh, no polling interval — it's driven by
+the same 1.5 s `useReplicas` tick.
+
+**CSS** uses CSS custom properties (`--accent`, `--bg`, etc.) throughout — the
+`replica-panel`'s accent color is passed as `style={{ '--accent': color }}` from
+the parent and picked up in the stylesheet. No external CSS framework — the
+entire theme is ~200 lines of vanilla CSS.
+
+---
+
+## 61. Docker + Makefile
+
+**`docker-compose.yml`** adds a `dashboard` service:
+
+```yaml
+dashboard:
+  build: ./frontend
+  ports: ["3000:3000"]
+  depends_on: [replica-a, replica-b, replica-c]
+```
+
+The `Dockerfile` is a two-stage build: `node:20-alpine` runs `npm install &&
+npm run build`, then `nginx:1.27-alpine` serves the `dist/` output. `nginx.conf`
+listens on port 3000 with an SPA fallback (`try_files $uri /index.html`).
+
+The dashboard makes API calls to `localhost:8080/8081/8082` — those are the
+Docker-mapped host ports, reachable from the user's browser. The replicas respond
+with CORS `Access-Control-Allow-Origin: *` so the browser doesn't block them.
+
+**Makefile** additions:
+
+```
+make frontend-install   # npm install (run once after clone)
+make frontend-dev       # vite dev server on :3000 (hot-reload)
+make frontend-build     # tsc && vite build → dist/
+make docker-up          # now builds all 4 services (replicas + dashboard)
+```
+
+---
+
+## 62. Phase 7 — Demo Output
+
+```bash
+make docker-up          # builds replicas + dashboard, starts all 4 containers
+```
+
+Browser → `http://localhost:3000`
+
+**Idle state:**
+- Header: `✓ Converged` (3/3 online, all hashes equal)
+- Three replica panels, all showing `nodes:0 ops:0`
+- Graph: "No nodes — start the sim..."
+- Timeline: "No operations yet"
+
+**Start simulation on Replica A:**
+- Click **Start Sim** on the A panel → 10 users, 5 ops/s
+- Graph fills with nodes and edges in real time
+- Timeline streams `create_node` entries at ~50 ops/s (10 users × 5)
+- All three replica hashes tick in sync → banner stays `✓ Converged`
+
+**Isolate Replica B:**
+- Click **Isolate** on B panel → B panel shows `ISOLATED` badge
+- B's node/op counts freeze; A and C continue growing
+- After a few seconds: banner flips to `⚠ Diverged`
+- B's hash diverges from A's and C's
+
+**Recover B:**
+- Click **Recover** on B panel → `ISOLATED` badge disappears
+- Within 3 s: anti-entropy tick fires, B receives missing ops
+- B's counts jump to match A and C; banner flips back to `✓ Converged`
+- B's hash: identical to A and C
+
+This is the full SentinelSync demo: concurrent writes, network partition,
+automatic recovery, provable convergence — all visible from a single browser tab.
+
+---
+
+## 63. Phase 7 — Known Limitations & What Phase 8 Adds
+
+| Limitation (by design) | Removed in |
+|---|---|
+| Polling (1.5 s interval) — state updates lag slightly | V2: backend pushes over WebSocket |
+| Graph positions from simulator are random [0,800]×[0,600] — layouts can overlap | Phase 8: replay positions are deterministic |
+| No operation detail panel (clicking an op shows nothing extra) | Phase 8 replay / timeline scrub |
+| Hard crash not wired to dashboard (must `docker compose stop` manually) | Phase 8 or dashboard enhancement |
+| No metrics charts (ops/sec, convergence time) | Phase 8 or metrics overlay |
+
+**Next: Phase 8 — Replay and Time Travel.** Add a "scrub" control to the
+timeline: pick any point in the operation log and reconstruct the CRDT state at
+that moment by replaying ops `[0..t]`. Show replica-level divergence/convergence
+as the scrubber moves. This turns the dashboard into a forensic tool — you can
+rewind a partition event and watch exactly which operation caused the split, and
+which anti-entropy sync closed it.
+
+*Last updated: Phase 7 complete (dashboard — React 18 + Vite 5 + React Flow 12;
+convergence banner, 3-replica panels with all controls, live graph, operation
+timeline; TypeScript clean build, Docker nginx service, CORS-enabled backend;
+full partition+recovery demo visible from browser).*
+
+---
+
+# Phase 8 — Replay and Time Travel
+
+**Goal:** turn the dashboard into a forensic tool. A developer should be able to
+scrub backwards through the operation log and watch the graph reconstruct itself
+op-by-op, and a chart should make the divergence/convergence curve visible as a
+line that splits and re-merges.
+
+After this phase the demo answers two questions interviewers actually ask:
+"How would you debug a divergence?" and "Can I see convergence happen in real
+time?"
+
+---
+
+## 64. Why Replay and What It Proves
+
+The existing dashboard is *observational* — it shows what is happening now. But
+the most compelling demo for CRDTs is what happened: a partition caused the state
+to diverge, anti-entropy detected the gap via vector-clock diff, and every missing
+operation was replayed into the lagging replica until the hashes matched.
+
+Replay makes that story scrubbable:
+
+| Without replay | With replay |
+|---|---|
+| "Trust me, the hashes converged." | Drag the slider to op 47 — three nodes visible. Drag to op 48 — a fourth appears. Drag to op 72 — the partition ends and B jumps from 23 to 41 nodes in one step. |
+
+The convergence chart adds the second axis: not just "did they converge?" but
+"how long did it take and how far did they drift?"
+
+---
+
+## 65. Backend: GET /replay
+
+**`internal/api/replay.go`** — the simplest possible implementation:
+
+```go
+func (h *Handler) handleReplay(c *gin.Context) {
+    upto, err := strconv.Atoi(c.Query("upto"))
+    if err != nil || upto < 0 {
+        c.JSON(400, gin.H{"error": "upto must be a non-negative integer"})
+        return
+    }
+    ops := h.replica.OpLog()
+    if len(ops) == 0 {
+        c.JSON(200, replica.New("replay", nil, nil).Snapshot())
+        return
+    }
+    if upto >= len(ops) { upto = len(ops) - 1 }
+    temp := replica.New("replay", nil, nil)
+    for _, op := range ops[:upto+1] {
+        temp.Ingest(op)
+    }
+    c.JSON(200, temp.Snapshot())
+}
+```
+
+The throwaway replica shares no state with the live replica — it gets its own
+OR-Set, LWW registers, and HLC. It never broadcasts. Replaying ops into it is
+idempotent (same op IDs, same state application), so the result is deterministic.
+
+The response shape is identical to `GET /graph` — the frontend can pass it
+directly to `GraphView` with no transformation. The frontend already knows
+`opLogLen` from `/status`, so no new "how many ops total?" endpoint is needed.
+
+---
+
+## 66. `internal/api/replay_test.go` — Four Tests
+
+| Test | What it checks |
+|---|---|
+| `TestReplayEmptyLog` | `GET /replay?upto=0` on an empty log → 200 with `{nodes:[],edges:[]}` |
+| `TestReplayBadParam` | `?upto=abc`, `?upto=-1`, missing `upto` → 400 |
+| `TestReplayUptoClamp` | 3 ops in log, `?upto=999` → clamped to 2, all 3 nodes returned |
+| `TestReplayAtIndex` | 3 ops, request `upto=0/1/2` → 1/2/3 nodes respectively |
+
+The test helper uses `httptest.NewRecorder` and `gin.New()` — same pattern as the
+rest of the api package. All 4 pass with `go test -race ./...`.
+
+---
+
+## 67. `hooks/useReplica.ts` — `useReplay` (Debounced)
+
+```typescript
+export function useReplay(replicaUrl: string, index: number | null) {
+  const [graph, setGraph] = useState<GraphSnapshot | null>(null)
+  const [loading, setLoading] = useState(false)
+  const cancelRef = useRef<boolean>(false)
+
+  useEffect(() => {
+    if (index === null) { setGraph(null); return }
+    cancelRef.current = false
+    setLoading(true)
+    const timer = setTimeout(async () => {
+      const res = await fetch(`${replicaUrl}/replay?upto=${index}`,
+        { signal: AbortSignal.timeout(2000) })
+      if (!cancelRef.current) { setGraph(await res.json()); setLoading(false) }
+    }, 150)
+    return () => { cancelRef.current = true; clearTimeout(timer) }
+  }, [replicaUrl, index])
+
+  return { graph, loading }
+}
+```
+
+The 150 ms debounce absorbs rapid slider drags — without it, dragging from op 0
+to op 300 would fire 300 concurrent requests. `cancelRef` (a ref, not state)
+prevents stale responses from landing after the hook re-ran with a new index.
+
+When `index === null` (live mode), the hook immediately clears the graph and
+returns — `App.tsx` then falls back to the live polling graph.
+
+---
+
+## 68. `components/ConvergenceChart.tsx` — SVG Line Chart
+
+The chart is a plain SVG with no chart library dependency:
+
+```
+viewBox="0 0 800 72"   preserveAspectRatio="none"
+```
+
+Data model: `HistoryPoint[] = { nodes: [n0,n1,n2]; hashes: [h0,h1,h2] }[]`
+(up to 60 samples, one per 1.5 s poll tick).
+
+Rendering:
+- **xOf(i)** = `(i / (N-1)) * 800` — left = oldest, right = newest
+- **yOf(n)** = `PAD_T + H - (n / maxNodes) * H` — top = high count, bottom = 0
+- Three `<polyline>` elements, one per replica accent color
+- Divergence detection: `active_hashes = hashes.filter(h => h !== ''); diverged = !all equal`
+- Contiguous diverged ranges → semi-transparent `<rect fill="#ef444418">` behind the lines
+- Latest-value `<circle r={3}>` dots at the right edge
+- Legend row: A/B/C color swatches + "diverged" swatch when any bands exist
+
+The chart updates every poll tick because `history` is state in `App.tsx`,
+re-derived from `statuses`. No imperative DOM manipulation — purely declarative.
+
+---
+
+## 69. `components/ReplayBar.tsx` — Scrubber + Live Button
+
+```
+[● LIVE]  ──────────────[range slider]──────────────  op 42 / 150  [REPLAY]
+```
+
+- `● LIVE` button: green ghost when live (no-op click disabled); red when in replay
+  (click → `onChange(null)` exits replay mode)
+- Range slider: `min=0 max={opLogLen-1}`, disabled when `opLogLen===0`
+- Counter: `op {index+1} / {opLogLen}` when replaying; `{opLogLen} ops` when live
+- Spinning `⟳` when `loading` is true (debounce window + fetch in-flight)
+- `REPLAY` badge only appears when `index !== null`
+
+The component is fully controlled — the caller (`App.tsx`) owns `index` and fires
+`setReplayIndex` via `onChange`. The bar has no internal state.
+
+When the user changes replica tabs, `App.tsx` resets `replayIndex` to `null` via
+`useEffect([selectedIdx])` so the bar never shows stale "replay" state for a
+different replica's op log.
+
+---
+
+## 70. `App.tsx` — History Buffer + Replay Mode Wiring
+
+**History accumulation:**
+
+```typescript
+const historyRef = useRef<HistoryPoint[]>([])
+
+useEffect(() => {
+  const hasAny = statuses.some(s => s && !s.error)
+  if (!hasAny) return
+  const point: HistoryPoint = {
+    nodes: [offline(0), offline(1), offline(2)],
+    hashes: [statuses[0]?.stateHash ?? '', ...],
+  }
+  historyRef.current = [...historyRef.current.slice(-59), point]
+  setHistory([...historyRef.current])
+}, [statuses])
+```
+
+`useRef` holds the accumulation buffer so appending doesn't trigger a re-render
+in a loop. The derived `history` state copy triggers the chart re-render. Offline
+replicas contribute 0 nodes and an empty hash — the chart treats them as
+offline/flat and the divergence check ignores empty hashes.
+
+**Graph selection:**
+
+```typescript
+const displayGraph = replayIndex !== null && replayGraph ? replayGraph : liveGraph
+```
+
+Live polling (`useGraph`) and replay (`useReplay`) run in parallel — switching back
+to live mode is instantaneous (no refetch needed). The live graph never stops
+polling while replay mode is active; returning to live shows the current state,
+not the state at replay exit.
+
+**Layout addition:** a `chart-section` is inserted between the replica-row and
+main-grid. The `ReplayBar` is placed inside the graph section, between the
+tab header and the React Flow canvas.
+
+---
+
+## 71. Phase 8 — Demo Output
+
+```bash
+make docker-up   # or: make frontend-dev (with replicas running)
+```
+
+Browser → `http://localhost:3000`
+
+**Convergence chart walkthrough:**
+- Start sim on Replica A (10 users, 5 ops/s)
+- Chart shows all three lines rising together — `✓ Converged` banner
+- Isolate Replica B — B's line flattens, A/C continue rising
+- Chart shows two rising lines and one flat line; divergence band (red tint) appears
+- Recover B — B's line jumps to match A and C; band ends; banner returns `✓ Converged`
+
+**Time travel walkthrough:**
+- Stop the sim — `opLogLen` freezes (e.g., 120 ops)
+- Drag the scrubber left to op 1 — graph shows one node
+- Drag right — nodes appear and disappear as create/delete ops are replayed
+- At the partition boundary, B's node count is visibly lower than A/C
+- At the recovery boundary, B jumps to match in one large step (the anti-entropy
+  burst replayed as a batch)
+- Click `● LIVE` — back to the live, fully-converged graph
+
+---
+
+## 72. Phase 8 — Known Limitations
+
+| Limitation | Notes |
+|---|---|
+| Replay does not show edge timing precisely | Edges may appear before their source/target nodes if operations arrive out of order (the CRDT allows it — dangling edges are filtered at materialization, so they disappear rather than render incorrectly) |
+| Chart has no X-axis timestamp labels | Sample index only; the scale says "~1.5 s per notch" implicitly |
+| History resets on page refresh | Stored in React state, not `localStorage` — intentional for simplicity |
+| Replay is from one replica's perspective | A multi-replica replay (simulating what each saw in real time) would require recording per-replica op logs over time — Phase 9 territory |
+| No "step forward/back" buttons | Range slider only — keyboard arrow keys work via native browser slider behaviour |
+
+The project is **feature-complete** for the 8-phase plan. All distributed systems
+primitives are in place: OR-Set, HLC, vector clock, gap-aware anti-entropy,
+chaos injection, virtual users, live dashboard, convergence chart, time travel.
+
+*Last updated: Phase 8 complete (replay + time travel — GET /replay endpoint,
+4 replay tests race-clean; useReplay debounced hook, ConvergenceChart SVG with
+divergence bands, ReplayBar scrubber, history accumulation in App.tsx;
+TypeScript clean 337 KB bundle).*

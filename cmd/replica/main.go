@@ -35,10 +35,23 @@ func main() {
 	go mgr.Start(context.Background())
 
 	engine := gin.Default()
+
+	// CORS — allows the dashboard (served on :3000) to call the replica REST APIs.
+	engine.Use(func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, DELETE, PATCH, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type")
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+		c.Next()
+	})
+
 	h.RegisterRoutes(engine)
 	engine.GET("/ws", gin.WrapF(mgr.HandleWS)) // peer connections land here
 
-	log.Printf("[%s] SentinelSync replica on %s — %d peer(s), CRDT + WebSocket replication + network simulation + virtual users active (Phase 6)",
+	log.Printf("[%s] SentinelSync replica on %s — %d peer(s), full stack active (Phase 7 — dashboard)",
 		replicaID, restAddr, len(peers))
 	if err := engine.Run(restAddr); err != nil {
 		log.Fatalf("[%s] server error: %v", replicaID, err)

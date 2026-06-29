@@ -11,6 +11,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.GET("/health", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
 	r.GET("/status", h.handleStatus)
 	r.GET("/graph", h.handleGetGraph)
+	r.GET("/ops", h.handleGetOps)
+	r.GET("/replay", h.handleReplay)
 
 	r.POST("/node", h.handleCreateNode)
 	r.PATCH("/node/:id/title", h.handleRenameNode)
