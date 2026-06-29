@@ -59,6 +59,16 @@ asked *"how does a cluster stay available when nodes die?"*, SentinelSync asks
 37. [Phase 4 — Demo Output (Live 3-Replica Convergence)](#37-phase-4--demo-output-live-3-replica-convergence)
 38. [Phase 4 — Known Limitations & What Phase 5 Adds](#38-phase-4--known-limitations--what-phase-5-adds)
 
+### Phase 5 — Network Simulation
+
+39. [The Problem With a Perfect Network](#39-the-problem-with-a-perfect-network)
+40. [internal/simulation/chaos.go — The Fault Injector](#40-internalsimulationchaosgo--the-fault-injector)
+41. [Transport Integration — Checking Chaos on Every Send/Receive](#41-transport-integration--checking-chaos-on-every-sendreceive)
+42. [internal/api/sim.go — /sim REST Endpoints](#42-internalapisimgo--sim-rest-endpoints)
+43. [Chaos Tests](#43-chaos-tests)
+44. [Phase 5 — Demo Output (Partition + Recovery)](#44-phase-5--demo-output-partition--recovery)
+45. [Phase 5 — Known Limitations & What Phase 6 Adds](#45-phase-5--known-limitations--what-phase-6-adds)
+
 ---
 
 ## 1. Project Overview
@@ -1333,3 +1343,256 @@ collapse the divergent state hashes back to one value. That is the interview dem
 *Last updated: Phase 4 complete (WebSocket replication — broadcast fast path,
 anti-entropy backstop, gap-aware vector clock; all tests race-clean; live
 3-replica Docker convergence verified).*
+
+---
+
+# Phase 5 — Network Simulation
+
+**Goal:** make the distributed systems demo *real*. Phase 4 proved convergence on
+a perfect Docker overlay network. Phase 5 adds runtime controls to break that
+network — inject latency, drop packets, or hard-partition a replica — and then
+watch anti-entropy automatically heal the divergence when conditions improve.
+
+After this phase you can demonstrate from a terminal (or later, the dashboard):
+isolate replica-b, keep writing on a and c, then recover b and watch all three
+`stateHash` values collapse to one value within seconds. That is the interview story.
+
+---
+
+## 39. The Problem With a Perfect Network
+
+Phase 4's live demo was compelling, but there was a catch: the network was
+Docker's internal overlay — essentially perfect. No drops, no reorder, no
+partition. The anti-entropy backstop was exercised only in the "pre-connect state"
+test; the broadcast fast path never failed.
+
+A distributed systems project that only demonstrates convergence under ideal
+conditions isn't demonstrating much. The hard part is: *what happens when nodes
+diverge, and how do they reunite?*
+
+Two failure modes are worth implementing separately because they demonstrate
+different recovery paths:
+
+| Failure | State retained? | Recovery |
+|---|---|---|
+| **Soft partition** (`POST /sim/isolate`) | Yes — process lives, in-memory op log intact | Cheap delta: B reconnects with a full clock, A sends only the diff |
+| **Hard crash** (`docker compose stop replica-b`) | No — process dies, all in-memory state lost | Full catch-up: B restarts with zero clock, anti-entropy streams entire history |
+
+The chaos injector here handles soft partition. Hard crash is covered by the
+existing anti-entropy loop — a restarted replica's zero clock causes `MissingFor`
+to return every op ever generated, and replay converges it.
+
+---
+
+## 40. `internal/simulation/chaos.go` — The Fault Injector
+
+**File:** `internal/simulation/chaos.go`
+
+Three independent knobs, all guarded by a single `sync.RWMutex`:
+
+| Knob | Direction | Effect |
+|---|---|---|
+| `latency time.Duration` | Outgoing only | `time.Sleep(latency)` before each write |
+| `lossRate float64` | Outgoing only | Drop with probability `p` (uses `math/rand/v2`) |
+| `isolated bool` | **Both** | Block all outgoing sends; discard all incoming messages |
+
+The split between "outgoing only" and "both directions" is deliberate:
+
+- **Packet loss** and **latency** model the link from *this replica to its peers*
+  — the replica can still receive what peers send to it. This is realistic: links
+  are often asymmetrically degraded.
+- **Isolation** models a full network partition — nothing gets in or out. This
+  is the important demo scenario: a replica is cut off, both sides diverge, then
+  the cut heals and anti-entropy re-unites them.
+
+**Key methods:**
+
+```go
+ShouldDrop() bool      // isolated || rand < lossRate — gate outgoing writes
+ApplyDelay()           // time.Sleep(latency) — called before each write
+IsIsolated() bool      // gate incoming message processing in readLoop
+Snapshot() Snapshot    // latencyMs, lossRate, isolated — for /status
+```
+
+All methods are safe for concurrent use. The transport's broadcast, anti-entropy
+ticker, and dial goroutines all run in separate goroutines and can call these
+simultaneously.
+
+---
+
+## 41. Transport Integration — Checking Chaos on Every Send/Receive
+
+**File:** `internal/transport/transport.go`
+
+`Manager` gains a `chaos *simulation.Chaos` field (passed in from `main.go`).
+Checks are minimal and non-invasive — the transport's structure is unchanged.
+
+**Outgoing checks (broadcast, anti-entropy, initial sync_request on connect):**
+
+```go
+// In Broadcast():
+for _, pc := range m.conns() {
+    if m.chaos.ShouldDrop() { continue }
+    m.chaos.ApplyDelay()
+    pc.write(message{Type: msgOp, Op: &op})
+}
+
+// In antiEntropyLoop():
+if m.chaos.IsIsolated() { continue }  // skip entire tick
+for _, pc := range m.conns() {
+    if m.chaos.ShouldDrop() { continue }
+    m.chaos.ApplyDelay()
+    pc.write(message{Type: msgSyncReq, Clock: clock})
+}
+```
+
+**Incoming check (readLoop):**
+
+```go
+if m.chaos.IsIsolated() {
+    continue  // discard the message — both directions blocked
+}
+// switch msg.Type { ... }
+```
+
+The read loop keeps the TCP connection alive even while isolated. This means
+lifting isolation is instant — the goroutine is already waiting on the socket,
+so the next message (from the peer's anti-entropy tick or our own) is processed
+immediately. No reconnect penalty, no 2-second wait.
+
+**Why not close connections during isolation?**
+
+Closing connections would mean the `dialLoop` tries to reconnect every 2 s. When
+isolation is lifted we'd have to wait for a successful dial before recovery could
+start. Keeping connections open but discarding messages gives instantaneous
+recovery — isolation ends, the next anti-entropy tick fires (at most 3 s), and
+we're back.
+
+---
+
+## 42. `internal/api/sim.go` — `/sim` REST Endpoints
+
+**File:** `internal/api/sim.go`
+
+Four endpoints, each returning the updated `Snapshot` so the caller can confirm
+what changed:
+
+| Endpoint | Payload | Action |
+|---|---|---|
+| `POST /sim/latency` | `{"ms": 200}` | Set outgoing message delay |
+| `POST /sim/loss` | `{"rate": 0.3}` | Set drop probability `[0.0–1.0]` |
+| `POST /sim/isolate` | (none) | Soft-partition this replica |
+| `POST /sim/recover` | (none) | Lift soft-partition |
+
+All four are wired in `routes.go` and share the `Handler.chaos` field added to
+the existing handler struct. `/status` also now includes `"chaos": {...}` so you
+can see each replica's current fault configuration without making a separate call.
+
+**Validation:**
+- `ms < 0` → 400 (negative latency is nonsensical)
+- `rate` outside `[0.0, 1.0]` → 400
+
+---
+
+## 43. Chaos Tests
+
+Two test files cover Phase 5.
+
+**`internal/simulation/chaos_test.go`** — unit tests for the Chaos struct:
+
+| Test | What it proves |
+|---|---|
+| `TestChaosDefaultNoDrop` | 1000 trials, zero loss, no drops |
+| `TestChaosIsolationAlwaysDrops` | isolated → every `ShouldDrop` = true |
+| `TestChaosIsolationLifted` | lifted isolation + zero loss → no drops |
+| `TestChaosFullLossDropsAll` | 100% loss → every `ShouldDrop` = true |
+| `TestChaosZeroLossDropsNone` | 0% loss → no drops (1000 trials) |
+| `TestChaosPartialLossApproximate` | 50% loss → 45–55% drop rate (10k trials) |
+| `TestChaosApplyDelayZero` | zero latency → returns in < 5 ms |
+| `TestChaosApplyDelayNonZero` | 20 ms latency → delays ≥ 15 ms |
+| `TestChaosSnapshot` | all fields round-trip through `Snapshot()` |
+
+**`internal/transport/transport_test.go`** — two new integration tests:
+
+**`TestChaosIsolationConverges`**: soft-isolates B while A writes two nodes.
+Asserts B has zero nodes after 100 ms (broadcast was discarded). Lifts isolation.
+Asserts convergence within 5 s (anti-entropy delivers the delta). This is the
+exact partition-recover scenario from the design docs, running on real WebSocket
+connections.
+
+**`TestChaosPacketLossConverges`**: sets 100% outgoing loss on A (so A's broadcast
+and anti-entropy sync_requests are all dropped). A writes two nodes. B stays at
+zero. Loss cleared. Within 6 s — one anti-entropy tick from A plus the round-trip
+— B catches up. Proves that loss is the send-side fault path and recovery relies
+on A's periodic sync_request, not B's.
+
+All tests pass under `-race` with real goroutines and gorilla/websocket connections.
+
+---
+
+## 44. Phase 5 — Demo Output (Partition + Recovery)
+
+Three Docker containers, same setup as Phase 4.
+
+**Isolate replica-b:**
+
+```
+POST localhost:8081/sim/isolate
+→ {"latencyMs":0,"lossRate":0,"isolated":true}
+```
+
+**Write on A while B is partitioned:**
+
+```
+POST localhost:8080/node  {"id":"n1","title":"Email",...}
+POST localhost:8080/node  {"id":"n2","title":"AI",...}
+```
+
+**B during partition — diverged:**
+
+```
+localhost:8081/status → nodes:0, stateHash:"e3b0c44…" (empty)
+localhost:8080/status → nodes:2, stateHash:"c34060f2…"
+```
+
+**Recover B:**
+
+```
+POST localhost:8081/sim/recover
+→ {"latencyMs":0,"lossRate":0,"isolated":false}
+```
+
+**All replicas 4 s later — converged:**
+
+```
+:8080  nodes=2  hash=c34060f2de17…
+:8081  nodes=2  hash=c34060f2de17…
+:8082  nodes=2  hash=c34060f2de17…
+```
+
+The `stateHash` values are identical. B rejoined, anti-entropy delivered the
+2-op delta, and the CRDT merged it. No coordination, no leader, no manual
+reconciliation — just the anti-entropy loop doing its job.
+
+---
+
+## 45. Phase 5 — Known Limitations & What Phase 6 Adds
+
+| Limitation (by design) | Removed in |
+|---|---|
+| Network faults are self-inflicted (API call required; nothing is automatic) | Phase 6 (simulated users + random faults) |
+| Only one replica can be faulted at a time from the CLI | Phase 7 dashboard (controls for all replicas in one UI) |
+| Latency only applies to outgoing messages, not to incoming | V2 |
+| Hard crash recovery is manual (`docker compose stop/start`) | Phase 7 dashboard (Hard Crash button) |
+| Tombstones and op log grow unbounded | V2 (causal-stability GC) |
+
+**Next: Phase 6 — Simulated Users.** Add a `SimulatedUser` engine that drives
+random create/rename/move/delete operations against a chosen replica at a
+configurable rate. With 100 virtual users spread across 3 replicas and packet
+loss active, the system runs a continuous convergence stress test — and the
+convergence checker (`stateHash`) is the oracle that confirms every replica
+ends up identical after quiescence.
+
+*Last updated: Phase 5 complete (network simulation — latency, packet loss, soft
+isolation, REST controls; partition+recovery demo verified on live 3-replica
+Docker cluster; 13 new tests, all race-clean).*

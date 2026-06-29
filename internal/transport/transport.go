@@ -10,6 +10,9 @@
 //     who reply with any operations it is missing. Reliability backstop — this
 //     is what recovers from dropped messages, partitions, and crashes.
 //
+// Phase 5 adds a Chaos injector that can introduce latency, packet loss, and
+// full soft-isolation on any replica at runtime via the /sim REST endpoints.
+//
 // Topology: a full mesh. Each replica DIALS every peer (outbound connections it
 // broadcasts on) and ACCEPTS connections from peers (inbound). Operations are
 // never relayed — a peer applies what it receives but does not re-broadcast it;
@@ -27,6 +30,7 @@ import (
 
 	"github.com/aryan-mishra/sentinel-sync/internal/crdt"
 	"github.com/aryan-mishra/sentinel-sync/internal/replica"
+	"github.com/aryan-mishra/sentinel-sync/internal/simulation"
 	"github.com/gorilla/websocket"
 )
 
@@ -45,10 +49,10 @@ const (
 
 // message is the wire envelope. Only the field relevant to Type is populated.
 type message struct {
-	Type  msgType           `json:"type"`
-	Op    *crdt.Operation   `json:"op,omitempty"`
-	Clock crdt.VectorClock  `json:"clock,omitempty"`
-	Ops   []crdt.Operation  `json:"ops,omitempty"`
+	Type  msgType          `json:"type"`
+	Op    *crdt.Operation  `json:"op,omitempty"`
+	Clock crdt.VectorClock `json:"clock,omitempty"`
+	Ops   []crdt.Operation `json:"ops,omitempty"`
 }
 
 // peerConn wraps a WebSocket connection with a write mutex — gorilla forbids
@@ -68,6 +72,7 @@ func (c *peerConn) write(v any) error {
 // Manager owns one replica's transport.
 type Manager struct {
 	replica  *replica.Replica
+	chaos    *simulation.Chaos
 	upgrader websocket.Upgrader
 
 	mu       sync.RWMutex
@@ -75,9 +80,10 @@ type Manager struct {
 }
 
 // NewManager builds a transport for r and registers itself as r's broadcaster.
-func NewManager(r *replica.Replica) *Manager {
+func NewManager(r *replica.Replica, chaos *simulation.Chaos) *Manager {
 	m := &Manager{
 		replica:  r,
+		chaos:    chaos,
 		outbound: make(map[string]*peerConn),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(*http.Request) bool { return true }, // intra-cluster only
@@ -107,11 +113,16 @@ func (m *Manager) Start(ctx context.Context) {
 	m.antiEntropyLoop(ctx)
 }
 
-// Broadcast pushes an operation to all connected peers. Best-effort: write
+// Broadcast pushes an operation to all connected peers. Chaos faults (isolation,
+// packet loss, latency) are applied per-peer before writing. Best-effort: write
 // failures just drop the connection (the dial loop reconnects, and anti-entropy
 // recovers anything missed).
 func (m *Manager) Broadcast(op crdt.Operation) {
 	for _, pc := range m.conns() {
+		if m.chaos.ShouldDrop() {
+			continue
+		}
+		m.chaos.ApplyDelay()
 		if err := pc.write(message{Type: msgOp, Op: &op}); err != nil {
 			_ = pc.ws.Close()
 		}
@@ -133,8 +144,11 @@ func (m *Manager) dialLoop(ctx context.Context, p replica.Peer) {
 		log.Printf("[%s] connected to peer %s", m.replica.ID, p.ID)
 
 		// Immediately reconcile on (re)connect — this is what makes a replica
-		// catch up after a partition or crash.
-		_ = pc.write(message{Type: msgSyncReq, Clock: m.replica.Clock()})
+		// catch up after a partition or crash. Skip the send if currently dropping.
+		if !m.chaos.ShouldDrop() {
+			m.chaos.ApplyDelay()
+			_ = pc.write(message{Type: msgSyncReq, Clock: m.replica.Clock()})
+		}
 
 		m.readLoop(pc) // blocks until the connection drops
 		m.clearOutbound(p.ID, pc)
@@ -149,6 +163,11 @@ func (m *Manager) readLoop(pc *peerConn) {
 		var msg message
 		if err := pc.ws.ReadJSON(&msg); err != nil {
 			return
+		}
+		// When isolated, discard all incoming messages — the replica is
+		// soft-partitioned (both directions blocked).
+		if m.chaos.IsIsolated() {
+			continue
 		}
 		switch msg.Type {
 		case msgOp:
@@ -176,8 +195,17 @@ func (m *Manager) antiEntropyLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Skip the tick entirely while isolated — no point sending a clock
+			// when all outgoing traffic is dropped.
+			if m.chaos.IsIsolated() {
+				continue
+			}
 			clock := m.replica.Clock()
 			for _, pc := range m.conns() {
+				if m.chaos.ShouldDrop() {
+					continue
+				}
+				m.chaos.ApplyDelay()
 				_ = pc.write(message{Type: msgSyncReq, Clock: clock})
 			}
 		}
