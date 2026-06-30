@@ -59,10 +59,11 @@ export interface HistoryPoint {
   hashes: [string, string, string]
 }
 
-export const REPLICAS = [
-  { id: 'replica-a', label: 'Replica A', url: 'http://localhost:8080' },
-  { id: 'replica-b', label: 'Replica B', url: 'http://localhost:8081' },
-  { id: 'replica-c', label: 'Replica C', url: 'http://localhost:8082' },
+export const CLIENTS = [
+  { id: 'browser-a', label: 'Browser A', url: 'http://localhost:8080' },
+  { id: 'browser-b', label: 'Browser B', url: 'http://localhost:8081' },
+  { id: 'browser-c', label: 'Browser C', url: 'http://localhost:8082' },
 ]
 
-export const REPLICA_COLORS = ['#3b82f6', '#22c55e', '#f97316'] // blue, green, orange
+// Indigo · Emerald · Amber — slightly deeper for light-mode contrast
+export const CLIENT_COLORS = ['#6366f1', '#059669', '#d97706']

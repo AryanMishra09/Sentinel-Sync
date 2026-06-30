@@ -30,7 +30,7 @@ export default function ReplicaPanel({ url, label, status, color, isSelected, on
   return (
     <div
       className={`replica-panel ${isSelected ? 'selected' : ''} ${offline ? 'panel-offline' : ''}`}
-      style={{ '--accent': color } as React.CSSProperties}
+      style={{ '--accent': color, '--client-a': color } as React.CSSProperties}
     >
       <div className="panel-header" onClick={onSelect}>
         <span className="panel-title">{label}</span>
@@ -38,7 +38,7 @@ export default function ReplicaPanel({ url, label, status, color, isSelected, on
       </div>
 
       {offline ? (
-        <div className="panel-offline-msg">Offline</div>
+        <div className="panel-offline-msg">Offline — is Docker running?</div>
       ) : (
         <>
           <div className="stats-row">
@@ -55,7 +55,7 @@ export default function ReplicaPanel({ url, label, status, color, isSelected, on
               <div className="stat-lbl">ops</div>
             </div>
             <div className="stat">
-              <div className="stat-val mono" title={s!.stateHash}>{s!.stateHash.slice(0, 8)}</div>
+              <div className="stat-val mono" title={s!.stateHash} style={{ fontSize: 11 }}>{s!.stateHash.slice(0, 7)}</div>
               <div className="stat-lbl">hash</div>
             </div>
           </div>
@@ -78,7 +78,7 @@ export default function ReplicaPanel({ url, label, status, color, isSelected, on
             )}
             {s!.sim.running && (
               <span className="badge badge-blue">
-                SIM {s!.sim.users}u · {s!.sim.totalOps} ops
+                {s!.sim.users}u · {s!.sim.totalOps} ops
               </span>
             )}
           </div>
@@ -89,16 +89,18 @@ export default function ReplicaPanel({ url, label, status, color, isSelected, on
                 className={`btn ${s!.chaos.isolated ? 'btn-green' : 'btn-red'}`}
                 disabled={busy}
                 onClick={() => call(s!.chaos.isolated ? '/sim/recover' : '/sim/isolate')}
+                style={{ flex: 1 }}
               >
                 {s!.chaos.isolated ? 'Recover' : 'Isolate'}
               </button>
             </div>
 
             <div className="ctrl-row">
+              <span className="ctrl-label">Latency</span>
               <input
                 className="ctrl-input"
                 value={latencyMs}
-                onChange={(e) => setLatencyMs(e.target.value)}
+                onChange={e => setLatencyMs(e.target.value)}
                 placeholder="ms"
               />
               <button
@@ -106,15 +108,16 @@ export default function ReplicaPanel({ url, label, status, color, isSelected, on
                 disabled={busy}
                 onClick={() => call('/sim/latency', { ms: parseInt(latencyMs) || 0 })}
               >
-                Set Latency
+                Set
               </button>
             </div>
 
             <div className="ctrl-row">
+              <span className="ctrl-label">Loss</span>
               <input
                 className="ctrl-input"
                 value={lossRate}
-                onChange={(e) => setLossRate(e.target.value)}
+                onChange={e => setLossRate(e.target.value)}
                 placeholder="0–1"
               />
               <button
@@ -122,39 +125,38 @@ export default function ReplicaPanel({ url, label, status, color, isSelected, on
                 disabled={busy}
                 onClick={() => call('/sim/loss', { rate: parseFloat(lossRate) || 0 })}
               >
-                Set Loss
+                Set
               </button>
             </div>
 
             <div className="ctrl-row sim-row">
+              <span className="ctrl-label">Sim</span>
               <input
                 className="ctrl-input"
                 value={simUsers}
-                onChange={(e) => setSimUsers(e.target.value)}
+                onChange={e => setSimUsers(e.target.value)}
                 placeholder="users"
               />
               <input
                 className="ctrl-input"
                 value={simOps}
-                onChange={(e) => setSimOps(e.target.value)}
+                onChange={e => setSimOps(e.target.value)}
                 placeholder="ops/s"
               />
               {s!.sim.running ? (
                 <button className="btn btn-yellow" disabled={busy} onClick={() => call('/sim/users/stop')}>
-                  Stop Sim
+                  Stop
                 </button>
               ) : (
                 <button
                   className="btn btn-blue"
                   disabled={busy}
-                  onClick={() =>
-                    call('/sim/users/start', {
-                      users: parseInt(simUsers) || 10,
-                      opsPerSec: parseFloat(simOps) || 5.0,
-                    })
-                  }
+                  onClick={() => call('/sim/users/start', {
+                    users: parseInt(simUsers) || 10,
+                    opsPerSec: parseFloat(simOps) || 5.0,
+                  })}
                 >
-                  Start Sim
+                  Start
                 </button>
               )}
             </div>

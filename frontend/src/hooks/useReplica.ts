@@ -1,20 +1,18 @@
 import { useState, useEffect, useRef } from 'react'
 import type { ReplicaStatus, GraphSnapshot, Operation } from '../types'
-import { REPLICAS } from '../types'
+import { CLIENTS } from '../types'
 
 export function useReplicas(interval = 1500) {
   const [statuses, setStatuses] = useState<(ReplicaStatus | null)[]>(
-    REPLICAS.map(() => null),
+    CLIENTS.map(() => null),
   )
 
   useEffect(() => {
     const poll = async () => {
       const results = await Promise.all(
-        REPLICAS.map(async ({ id, url }) => {
+        CLIENTS.map(async ({ id, url }) => {
           try {
-            const res = await fetch(`${url}/status`, {
-              signal: AbortSignal.timeout(1000),
-            })
+            const res = await fetch(`${url}/status`, { signal: AbortSignal.timeout(1000) })
             if (!res.ok) throw new Error(`HTTP ${res.status}`)
             return (await res.json()) as ReplicaStatus
           } catch (e) {
@@ -39,13 +37,11 @@ export function useGraph(replicaUrl: string, interval = 1500) {
   useEffect(() => {
     const poll = async () => {
       try {
-        const res = await fetch(`${replicaUrl}/graph`, {
-          signal: AbortSignal.timeout(1000),
-        })
+        const res = await fetch(`${replicaUrl}/graph`, { signal: AbortSignal.timeout(1000) })
         if (!res.ok) return
         setGraph(await res.json())
       } catch {
-        // replica offline — keep stale graph
+        // keep stale graph
       }
     }
 
@@ -63,13 +59,11 @@ export function useOps(replicaUrl: string, interval = 1500) {
   useEffect(() => {
     const poll = async () => {
       try {
-        const res = await fetch(`${replicaUrl}/ops`, {
-          signal: AbortSignal.timeout(1000),
-        })
+        const res = await fetch(`${replicaUrl}/ops`, { signal: AbortSignal.timeout(1000) })
         if (!res.ok) return
         setOps(await res.json())
       } catch {
-        // replica offline — keep stale list
+        // keep stale list
       }
     }
 
@@ -81,60 +75,66 @@ export function useOps(replicaUrl: string, interval = 1500) {
   return ops
 }
 
-// useReplay fetches GET /replay?upto=<index> with a 150 ms debounce so dragging
-// the scrubber quickly does not flood the backend. Returns null while loading or
-// when index is null (live mode).
 export function useReplay(replicaUrl: string, index: number | null) {
   const [graph, setGraph] = useState<GraphSnapshot | null>(null)
   const [loading, setLoading] = useState(false)
   const cancelRef = useRef<boolean>(false)
 
   useEffect(() => {
-    if (index === null) {
-      setGraph(null)
-      setLoading(false)
-      return
-    }
-
+    if (index === null) { setGraph(null); setLoading(false); return }
     cancelRef.current = false
     setLoading(true)
-
     const timer = setTimeout(async () => {
       try {
-        const res = await fetch(`${replicaUrl}/replay?upto=${index}`, {
-          signal: AbortSignal.timeout(2000),
-        })
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const res = await fetch(`${replicaUrl}/replay?upto=${index}`, { signal: AbortSignal.timeout(2000) })
+        if (!res.ok) throw new Error()
         const data = (await res.json()) as GraphSnapshot
-        if (!cancelRef.current) {
-          setGraph(data)
-          setLoading(false)
-        }
+        if (!cancelRef.current) { setGraph(data); setLoading(false) }
       } catch {
         if (!cancelRef.current) setLoading(false)
       }
     }, 150)
-
-    return () => {
-      cancelRef.current = true
-      clearTimeout(timer)
-    }
+    return () => { cancelRef.current = true; clearTimeout(timer) }
   }, [replicaUrl, index])
 
   return { graph, loading }
 }
 
-// api — fire a POST and return the response body (or null on error).
-export async function apiPost(url: string, body?: object): Promise<unknown> {
+// ── Mutation helpers ────────────────────────────────────────────────────────
+
+export async function apiFetch(
+  url: string,
+  method: string,
+  body?: object,
+): Promise<unknown> {
   try {
     const res = await fetch(url, {
-      method: 'POST',
+      method,
       headers: body ? { 'Content-Type': 'application/json' } : {},
       body: body ? JSON.stringify(body) : undefined,
     })
-    if (!res.ok) return null
-    return await res.json()
+    const text = await res.text()
+    return text ? JSON.parse(text) : null
   } catch {
     return null
   }
 }
+
+export const apiPost = (url: string, body?: object) => apiFetch(url, 'POST', body)
+export const apiDelete = (url: string) => apiFetch(url, 'DELETE')
+export const apiPatch = (url: string, body: object) => apiFetch(url, 'PATCH', body)
+
+export const createNode = (baseUrl: string, id: string, title: string, x: number, y: number) =>
+  apiPost(`${baseUrl}/node`, { id, title, x, y })
+
+export const deleteNode = (baseUrl: string, id: string) =>
+  apiDelete(`${baseUrl}/node/${id}`)
+
+export const renameNode = (baseUrl: string, id: string, title: string) =>
+  apiPatch(`${baseUrl}/node/${id}/title`, { title })
+
+export const createEdge = (baseUrl: string, id: string, source: string, target: string) =>
+  apiPost(`${baseUrl}/edge`, { id, source, target })
+
+export const deleteEdge = (baseUrl: string, id: string) =>
+  apiDelete(`${baseUrl}/edge/${id}`)

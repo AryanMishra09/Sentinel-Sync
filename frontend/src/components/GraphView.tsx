@@ -26,26 +26,27 @@ export default function GraphView({ graph, color }: Props) {
 
   useEffect(() => {
     setNodes(
-      graph.nodes.map((n) => ({
+      graph.nodes.map(n => ({
         id: n.id,
         position: { x: n.x, y: n.y },
         data: { label: n.title || n.id },
         style: {
-          background: '#1e2235',
-          border: `1px solid ${color}55`,
-          color: '#e2e8f0',
+          background: '#ffffff',
+          border: `1.5px solid ${color}50`,
+          color: '#0f172a',
           borderRadius: 8,
-          fontSize: 12,
-          padding: '4px 10px',
+          fontSize: 11,
+          padding: '5px 12px',
+          boxShadow: `0 2px 8px rgba(0,0,0,0.08), 0 0 0 0px ${color}`,
         },
       })),
     )
     setEdges(
-      graph.edges.map((e) => ({
+      graph.edges.map(e => ({
         id: e.id,
         source: e.source,
         target: e.target,
-        style: { stroke: color + '88' },
+        style: { stroke: color + '80', strokeWidth: 1.5 },
       })),
     )
   }, [graph, color, setNodes, setEdges])
@@ -53,7 +54,7 @@ export default function GraphView({ graph, color }: Props) {
   if (graph.nodes.length === 0) {
     return (
       <div className="graph-empty">
-        No nodes — start the sim or POST /node to create some
+        No nodes — create one in Graph Editor below, or run a Scenario
       </div>
     )
   }
@@ -65,16 +66,16 @@ export default function GraphView({ graph, color }: Props) {
       onNodesChange={onNodesChange}
       onEdgesChange={onEdgesChange}
       fitView
-      fitViewOptions={{ padding: 0.2 }}
-      colorMode="dark"
+      fitViewOptions={{ padding: 0.25 }}
+      colorMode="light"
       proOptions={{ hideAttribution: true }}
     >
-      <Background color="#2a2d3e" />
+      <Background color="rgba(148,163,184,0.2)" gap={24} />
       <Controls />
       <MiniMap
-        nodeColor={color + 'aa'}
-        maskColor="#0f111880"
-        style={{ background: '#1a1d2e' }}
+        nodeColor={color + '99'}
+        maskColor="rgba(241,245,249,0.85)"
+        style={{ background: '#ffffff', border: '1px solid #e2e8f0' }}
       />
     </ReactFlow>
   )

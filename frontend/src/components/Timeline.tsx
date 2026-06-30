@@ -34,7 +34,9 @@ export default function Timeline({ ops }: Props) {
         <div key={op.id} className={`timeline-row ${OP_CLASS[op.type] ?? ''}`}>
           <span className="tl-time">{fmtTime(op.hlc.physical)}</span>
           <span className="tl-type">{fmtType(op.type)}</span>
-          <span className="tl-replica">{op.replicaId.replace('replica-', '')}</span>
+          <span className="tl-replica">
+            {op.replicaId === 'replica-a' ? 'Browser A' : op.replicaId === 'replica-b' ? 'Browser B' : 'Browser C'}
+          </span>
           <span className="tl-id mono">{op.id}</span>
         </div>
       ))}
